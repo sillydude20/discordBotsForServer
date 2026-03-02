@@ -55,6 +55,18 @@ async function handleStarReaction(reaction: MessageReaction | PartialMessageReac
   await saveStarboardMessage(message.id, sent.id, message.guild.id);
 }
 
+function formatContent(content: string): string {
+  if (!content) return "*No text content*";
+  
+  content = content.replace(/<a?:(\w+):(\d+)>/g, (match, name, id) => {
+    const ext = match.startsWith("<a:") ? "gif" : "png";
+    return `[:${name}:](https://cdn.discordapp.com/emojis/${id}.${ext})`;
+  });
+  
+  return content;
+}
+
+
 async function buildEmbed(message: any, starCount: number, member: GuildMember) {
   const embed = new EmbedBuilder()
     .setAuthor({
