@@ -1,11 +1,18 @@
 # discordBotsForServer
 bots for discord
 TODO
-have tenor links work and also like twitter links as welll
-have stickers work in rare case 
+
 
 Chat deletion - Perchannel basis (flash is 69 seconds, general and bot channels are set to 24 hours, and the vc is set to an hour - low prio)
-Booster bot 
+
+
+
+Booster bot  - Just let it make the roles sex colors and types for names, and added the picture and stuff
+And if you can, have it expire when they stop boosting
+
+
+
+
 Confession 
 Star board 
 Quote 

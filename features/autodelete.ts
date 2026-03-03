@@ -1,12 +1,6 @@
 // src/features/autodelete.ts
 // ─────────────────────────────────────────────────────────────
-// Commands:
-//   /autodelete set    #channel <duration>  — enable auto-delete
-//   /autodelete remove #channel             — disable auto-delete
-//   /autodelete list                        — show all rules
-//   /autodelete purge  #channel             — delete all messages now
-//
-// Duration formats: 30s | 5m | 2h | 1d | 7d
+// Rules are persisted in bot.db and survive restarts.
 // ─────────────────────────────────────────────────────────────
 
 import {
@@ -22,6 +16,11 @@ import {
   Collection,
   Snowflake,
 } from 'discord.js';
+import {
+  getAutoDeleteRules,
+  saveAutoDeleteRule,
+  deleteAutoDeleteRule,
+} from '../utils/database';
 
 // ── Types ─────────────────────────────────────────────────────
 
@@ -40,10 +39,21 @@ const MULTIPLIERS: Record<DurationUnit, number> = {
   d: 86_400_000,
 };
 
-// ── In-memory store ───────────────────────────────────────────
-// Map<channelId, AutoDeleteRule>
-// For persistence across restarts, swap with the SQLite helper at the bottom.
+// ── In-memory cache (loaded from DB on startup) ───────────────
 const autoDeleteRules = new Map<string, AutoDeleteRule>();
+
+export async function loadAutoDeleteRules(): Promise<void> {
+  const rows = await getAutoDeleteRules();
+  autoDeleteRules.clear();
+  for (const row of rows) {
+    autoDeleteRules.set(row.channelId, {
+      guildId: row.guildId,
+      delayMs: row.delayMs,
+      label: row.label,
+    });
+  }
+  console.log(`📦 Loaded ${autoDeleteRules.size} auto-delete rule(s) from database`);
+}
 
 // ── Duration helpers ──────────────────────────────────────────
 
@@ -111,28 +121,22 @@ export async function registerAutoDeleteCommands(
 ): Promise<void> {
   const rest = new REST({ version: '10' }).setToken(token);
   const body = [autoDeleteCommand.toJSON()];
-
   if (guildId) {
     await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body });
-    console.log(`✅ /autodelete registered for guild ${guildId}`);
   } else {
     await rest.put(Routes.applicationCommands(clientId), { body });
-    console.log('✅ /autodelete registered globally');
   }
 }
 
 // ── Bulk-delete helper ────────────────────────────────────────
-// Handles Discord's 100-message fetch limit and 14-day bulk-delete restriction.
 
 async function bulkDeleteChannel(channel: TextChannel): Promise<number> {
   let deleted = 0;
+  const TWO_WEEKS = 14 * 86_400_000 - 60_000;
 
-  // eslint-disable-next-line no-constant-condition
   while (true) {
     const fetched: Collection<Snowflake, Message> = await channel.messages.fetch({ limit: 100 });
     if (!fetched.size) break;
-
-    const TWO_WEEKS = 14 * 86_400_000 - 60_000;
 
     const recent = fetched.filter((m) => Date.now() - m.createdTimestamp < TWO_WEEKS);
     const old    = fetched.filter((m) => Date.now() - m.createdTimestamp >= TWO_WEEKS);
@@ -144,20 +148,11 @@ async function bulkDeleteChannel(channel: TextChannel): Promise<number> {
       await recent.first()!.delete();
       deleted++;
     }
-
     for (const msg of old.values()) {
-      try {
-        await msg.delete();
-        deleted++;
-        await sleep(1_100);
-      } catch {
-        // already deleted or missing permissions — skip
-      }
+      try { await msg.delete(); deleted++; await sleep(1_100); } catch { /* skip */ }
     }
-
     if (fetched.size < 100) break;
   }
-
   return deleted;
 }
 
@@ -169,7 +164,6 @@ async function sweepChannel(channel: TextChannel, delayMs: number): Promise<numb
   let deleted = 0;
   let before: Snowflake | undefined;
 
-  // eslint-disable-next-line no-constant-condition
   while (true) {
     const options: FetchMessagesOptions = { limit: 100 };
     if (before) options.before = before;
@@ -178,9 +172,8 @@ async function sweepChannel(channel: TextChannel, delayMs: number): Promise<numb
     if (!fetched.size) break;
 
     const toDelete = fetched.filter((m) => m.createdTimestamp < cutoff);
-
-    const recent = toDelete.filter((m) => Date.now() - m.createdTimestamp < TWO_WEEKS);
-    const old    = toDelete.filter((m) => Date.now() - m.createdTimestamp >= TWO_WEEKS);
+    const recent   = toDelete.filter((m) => Date.now() - m.createdTimestamp < TWO_WEEKS);
+    const old      = toDelete.filter((m) => Date.now() - m.createdTimestamp >= TWO_WEEKS);
 
     if (recent.size > 1) {
       const result = await channel.bulkDelete(recent, true);
@@ -189,21 +182,14 @@ async function sweepChannel(channel: TextChannel, delayMs: number): Promise<numb
       await recent.first()!.delete();
       deleted++;
     }
-
     for (const msg of old.values()) {
-      try {
-        await msg.delete();
-        deleted++;
-      } catch {
-        // skip
-      }
+      try { await msg.delete(); deleted++; } catch { /* skip */ }
       await sleep(1_100);
     }
 
     before = fetched.last()?.id;
     if (fetched.size < 100) break;
   }
-
   return deleted;
 }
 
@@ -218,17 +204,16 @@ export function startSweepLoop(client: Client): void {
         const channel = await client.channels.fetch(channelId);
         if (!channel || !channel.isTextBased()) {
           autoDeleteRules.delete(channelId);
+          await deleteAutoDeleteRule(channelId);
           continue;
         }
         const count = await sweepChannel(channel as TextChannel, rule.delayMs);
         if (count > 0) {
-          console.log(
-            `🗑  Swept ${count} messages from #${(channel as TextChannel).name} (rule: ${rule.label})`,
-          );
+          console.log(`🗑  Swept ${count} messages from #${(channel as TextChannel).name} (rule: ${rule.label})`);
         }
       } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.warn(`Sweep failed for channel ${channelId}:`, message);
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`Sweep failed for channel ${channelId}:`, msg);
       }
     }
   }, SWEEP_INTERVAL_MS);
@@ -237,12 +222,9 @@ export function startSweepLoop(client: Client): void {
 }
 
 // ── Real-time deletion on message arrival ─────────────────────
-// Schedules a deletion the moment a message is posted, so it's
-// removed at exactly the right time without waiting for the sweep.
 
 export function handleMessage(message: Message): void {
   if (message.author.bot) return;
-
   const rule = autoDeleteRules.get(message.channelId);
   if (!rule) return;
 
@@ -250,9 +232,7 @@ export function handleMessage(message: Message): void {
     try {
       const msg = await message.channel.messages.fetch(message.id).catch(() => null);
       if (msg) await msg.delete();
-    } catch {
-      // already deleted — ignore
-    }
+    } catch { /* already deleted */ }
   }, rule.delayMs);
 }
 
@@ -272,29 +252,25 @@ export async function handleAutoDeleteInteraction(
     const delayMs     = parseDuration(durationStr);
 
     if (!delayMs) {
-      await interaction.reply({
-        content: '❌ Invalid duration. Use formats like `30s`, `5m`, `2h`, `1d`.',
-        ephemeral: true,
-      });
+      await interaction.reply({ content: '❌ Invalid duration. Use formats like `30s`, `5m`, `2h`, `1d`.', ephemeral: true });
       return;
     }
-
     if (delayMs < 5_000) {
-      await interaction.reply({
-        content: '❌ Minimum duration is **5 seconds**.',
-        ephemeral: true,
-      });
+      await interaction.reply({ content: '❌ Minimum duration is **5 seconds**.', ephemeral: true });
       return;
     }
 
-    autoDeleteRules.set(channel.id, {
+    const rule: AutoDeleteRule = {
       guildId: interaction.guildId ?? '',
       delayMs,
       label: formatDuration(delayMs),
-    });
+    };
+
+    autoDeleteRules.set(channel.id, rule);
+    await saveAutoDeleteRule(channel.id, rule.guildId, rule.delayMs, rule.label);
 
     await interaction.reply({
-      content: `✅ Auto-delete enabled in <#${channel.id}>. Messages will be deleted after **${formatDuration(delayMs)}**.`,
+      content: `✅ Auto-delete enabled in <#${channel.id}>. Messages will be deleted after **${rule.label}**.`,
       ephemeral: true,
     });
     return;
@@ -305,18 +281,14 @@ export async function handleAutoDeleteInteraction(
     const channel = interaction.options.getChannel('channel', true);
 
     if (!autoDeleteRules.has(channel.id)) {
-      await interaction.reply({
-        content: `ℹ️ No auto-delete rule found for <#${channel.id}>.`,
-        ephemeral: true,
-      });
+      await interaction.reply({ content: `ℹ️ No auto-delete rule found for <#${channel.id}>.`, ephemeral: true });
       return;
     }
 
     autoDeleteRules.delete(channel.id);
-    await interaction.reply({
-      content: `🗑 Auto-delete disabled for <#${channel.id}>.`,
-      ephemeral: true,
-    });
+    await deleteAutoDeleteRule(channel.id);
+
+    await interaction.reply({ content: `🗑 Auto-delete disabled for <#${channel.id}>.`, ephemeral: true });
     return;
   }
 
@@ -327,10 +299,7 @@ export async function handleAutoDeleteInteraction(
     );
 
     if (!guildRules.length) {
-      await interaction.reply({
-        content: 'ℹ️ No auto-delete rules configured for this server.',
-        ephemeral: true,
-      });
+      await interaction.reply({ content: 'ℹ️ No auto-delete rules configured for this server.', ephemeral: true });
       return;
     }
 
@@ -348,7 +317,6 @@ export async function handleAutoDeleteInteraction(
   // /autodelete purge
   if (sub === 'purge') {
     const channel = interaction.options.getChannel('channel', true);
-
     await interaction.deferReply({ ephemeral: true });
 
     try {
@@ -357,14 +325,11 @@ export async function handleAutoDeleteInteraction(
         await interaction.editReply({ content: '❌ That channel is not a text channel.' });
         return;
       }
-
       const count = await bulkDeleteChannel(textChannel as TextChannel);
-      await interaction.editReply({
-        content: `🗑 Purged **${count}** messages from <#${channel.id}>.`,
-      });
+      await interaction.editReply({ content: `🗑 Purged **${count}** messages from <#${channel.id}>.` });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      await interaction.editReply({ content: `❌ Failed to purge: ${message}` });
+      const msg = err instanceof Error ? err.message : String(err);
+      await interaction.editReply({ content: `❌ Failed to purge: ${msg}` });
     }
   }
 }
@@ -374,67 +339,3 @@ export async function handleAutoDeleteInteraction(
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
-// ── Register with your client in index.ts ─────────────────────
-//
-// import {
-//   startSweepLoop,
-//   handleMessage,
-//   handleAutoDeleteInteraction,
-//   registerAutoDeleteCommands,
-// } from './features/autodelete';
-//
-// client.once('ready', async () => {
-//   await registerAutoDeleteCommands(TOKEN, CLIENT_ID /*, guildId for testing */);
-//   startSweepLoop(client);
-// });
-//
-// client.on('messageCreate', handleMessage);
-// client.on('interactionCreate', (i) => {
-//   if (i.isChatInputCommand()) handleAutoDeleteInteraction(i);
-// });
-
-// ─────────────────────────────────────────────────────────────
-// PERSISTENCE (SQLite via better-sqlite3)
-// ─────────────────────────────────────────────────────────────
-// npm install better-sqlite3 @types/better-sqlite3
-//
-// import Database from 'better-sqlite3';
-// const db = new Database('./data/bot.db');
-//
-// db.exec(`
-//   CREATE TABLE IF NOT EXISTS autodelete_rules (
-//     channel_id TEXT PRIMARY KEY,
-//     guild_id   TEXT NOT NULL,
-//     delay_ms   INTEGER NOT NULL,
-//     label      TEXT NOT NULL
-//   )
-// `);
-//
-// export function loadRules(): void {
-//   const rows = db.prepare('SELECT * FROM autodelete_rules').all() as {
-//     channel_id: string; guild_id: string; delay_ms: number; label: string;
-//   }[];
-//   for (const row of rows) {
-//     autoDeleteRules.set(row.channel_id, {
-//       guildId: row.guild_id,
-//       delayMs: row.delay_ms,
-//       label: row.label,
-//     });
-//   }
-// }
-//
-// function saveRule(channelId: string, rule: AutoDeleteRule): void {
-//   db.prepare(`
-//     INSERT INTO autodelete_rules (channel_id, guild_id, delay_ms, label)
-//     VALUES (?, ?, ?, ?)
-//     ON CONFLICT(channel_id) DO UPDATE SET delay_ms=excluded.delay_ms, label=excluded.label
-//   `).run(channelId, rule.guildId, rule.delayMs, rule.label);
-// }
-//
-// function deleteRule(channelId: string): void {
-//   db.prepare('DELETE FROM autodelete_rules WHERE channel_id = ?').run(channelId);
-// }
-//
-// Then call saveRule() after set, deleteRule() after remove,
-// and loadRules() in your ready event.
