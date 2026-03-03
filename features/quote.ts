@@ -1,443 +1,314 @@
 // src/features/quote.ts
-// ─────────────────────────────────────────────────────────────
-// Quote image generator — triggered two ways:
-//   1. @bot reply    — reply to any message and @mention the bot
-//   2. /quote @user  — slash command targeting a specific message
-//
-// Buttons on the output:
-//   🎨 Background  — cycles through background styles
-//   🌈 Color       — cycles accent/text colors
-//   🔄 Regenerate  — re-fetches and rebuilds the image
-//   B  Bold        — toggle bold quote text
-//   NEW New quote   — pick a random message from that user
-//
-// Install required dependency:
-//   npm install @napi-rs/canvas
-// ─────────────────────────────────────────────────────────────
-
 import {
-  Client,
-  Message,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  ButtonInteraction,
-  ComponentType,
-  AttachmentBuilder,
-  EmbedBuilder,
-  Colors,
+  Client, Message, ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  ButtonInteraction, ComponentType, AttachmentBuilder,
 } from 'discord.js';
-import { createCanvas, loadImage, GlobalFonts, SKRSContext2D } from '@napi-rs/canvas';
-import * as path from 'path';
-
-// ── Types ─────────────────────────────────────────────────────
+import { createCanvas, loadImage, SKRSContext2D } from '@napi-rs/canvas';
 
 interface QuoteState {
-  authorId: string;
-  authorName: string;
-  authorAvatar: string;
-  authorHandle: string;
-  content: string;
-  bgStyle: number;
-  colorScheme: number;
-  bold: boolean;
-  guildId: string;
-  channelId: string;
+  authorId: string; authorName: string; authorAvatar: string;
+  authorHandle: string; content: string;
+  grayscale: boolean; vertical: boolean; bold: boolean;
+  guildId: string; channelId: string;
 }
 
-// ── Style definitions ─────────────────────────────────────────
+const BG = '#0f0f0f'; const TEXT = '#ffffff'; const SUB = '#aaaaaa'; const RADIUS = 16;
 
-const BG_STYLES = [
-  { name: 'Dark',        bg: '#0d0d0d', card: '#141414' },
-  { name: 'Midnight',    bg: '#0a0a1a', card: '#12122a' },
-  { name: 'Forest',      bg: '#0a120a', card: '#101a10' },
-  { name: 'Crimson',     bg: '#150505', card: '#1e0a0a' },
-  { name: 'Slate',       bg: '#0f1117', card: '#171b26' },
-];
-
-const COLOR_SCHEMES = [
-  { text: '#ffffff', accent: '#a78bfa', handle: '#6b7280' }, // purple
-  { text: '#ffffff', accent: '#60a5fa', handle: '#6b7280' }, // blue
-  { text: '#ffffff', accent: '#34d399', handle: '#6b7280' }, // green
-  { text: '#ffffff', accent: '#f87171', handle: '#6b7280' }, // red
-  { text: '#ffffff', accent: '#fbbf24', handle: '#6b7280' }, // gold
-  { text: '#ffffff', accent: '#f472b6', handle: '#6b7280' }, // pink
-];
-
-// ── Canvas drawing ────────────────────────────────────────────
-
-const WIDTH  = 900;
-const HEIGHT = 400;
-const AVATAR_SIZE = 160;
-
-// Wrap text to fit within maxWidth, returns array of lines
-function wrapText(
-  ctx: SKRSContext2D,
-  text: string,
-  maxWidth: number,
-): string[] {
+function wrapText(ctx: SKRSContext2D, text: string, maxW: number): string[] {
   const words = text.split(' ');
   const lines: string[] = [];
-  let current = '';
+  let line = '';
 
   for (const word of words) {
-    const test = current ? `${current} ${word}` : word;
-    if (ctx.measureText(test).width > maxWidth && current) {
-      lines.push(current);
-      current = word;
+    // If a single word is wider than maxW, break it character by character
+    if (ctx.measureText(word).width > maxW) {
+      if (line) { lines.push(line); line = ''; }
+      let partial = '';
+      for (const char of word) {
+        if (ctx.measureText(partial + char).width > maxW) {
+          lines.push(partial);
+          partial = char;
+        } else {
+          partial += char;
+        }
+      }
+      if (partial) line = partial;
+      continue;
+    }
+
+    const test = line ? `${line} ${word}` : word;
+    if (ctx.measureText(test).width > maxW && line) {
+      lines.push(line);
+      line = word;
     } else {
-      current = test;
+      line = test;
     }
   }
-  if (current) lines.push(current);
+
+  if (line) lines.push(line);
   return lines;
 }
 
-// Draw a rounded rectangle path
-function roundRect(
-  ctx: SKRSContext2D,
-  x: number, y: number,
-  w: number, h: number,
-  r: number,
-): void {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-  ctx.lineTo(x + r, y + h);
-  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-  ctx.lineTo(x, y + r);
-  ctx.quadraticCurveTo(x, y, x + r, y);
-  ctx.closePath();
+function roundRect(ctx: SKRSContext2D, x: number, y: number, w: number, h: number, r: number) {
+  ctx.beginPath(); ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y); ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+  ctx.lineTo(x+w,y+h-r); ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h); ctx.lineTo(x+r,y+h);
+  ctx.quadraticCurveTo(x,y+h,x,y+h-r); ctx.lineTo(x,y+r); ctx.quadraticCurveTo(x,y,x+r,y); ctx.closePath();
 }
 
-export async function generateQuoteImage(state: QuoteState): Promise<Buffer> {
-  const canvas = createCanvas(WIDTH, HEIGHT);
-  const ctx    = canvas.getContext('2d');
+function applyGrayscale(ctx: SKRSContext2D, x: number, y: number, w: number, h: number) {
+  const d = ctx.getImageData(x,y,w,h); const data = d.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const avg = 0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2];
+    data[i] = data[i+1] = data[i+2] = avg;
+  }
+  ctx.putImageData(d, x, y);
+}
 
-  const bg     = BG_STYLES[state.bgStyle % BG_STYLES.length];
-  const scheme = COLOR_SCHEMES[state.colorScheme % COLOR_SCHEMES.length];
+async function drawHorizontal(ctx: SKRSContext2D, state: QuoteState) {
+  const W = 1200, H = 630, AW = 560, FW = 220;
+  const TEXT_X = 670;           // left edge of text, well past the fade
+  const TEXT_W = W - TEXT_X - 60;  // = 470px available
+  const PAD_V = 50;
 
-  // ── Background ─────────────────────────────────────────────
-  ctx.fillStyle = bg.bg;
-  ctx.fillRect(0, 0, WIDTH, HEIGHT);
-
-  // Subtle radial vignette
-  const vignette = ctx.createRadialGradient(
-    WIDTH / 2, HEIGHT / 2, HEIGHT * 0.2,
-    WIDTH / 2, HEIGHT / 2, HEIGHT * 0.9,
-  );
-  vignette.addColorStop(0, 'rgba(0,0,0,0)');
-  vignette.addColorStop(1, 'rgba(0,0,0,0.6)');
-  ctx.fillStyle = vignette;
-  ctx.fillRect(0, 0, WIDTH, HEIGHT);
-
-  // Card panel
-  ctx.fillStyle = bg.card;
-  roundRect(ctx, 30, 30, WIDTH - 60, HEIGHT - 60, 20);
-  ctx.fill();
-
-  // Left accent bar
-  ctx.fillStyle = scheme.accent;
-  roundRect(ctx, 30, 30, 6, HEIGHT - 60, 3);
-  ctx.fill();
-
-  // ── Avatar (circular, left side) ──────────────────────────
-  const avatarX = 80;
-  const avatarY = HEIGHT / 2 - AVATAR_SIZE / 2;
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fillRect(0, 0, W, H);
 
   try {
-    const avatarImg = await loadImage(state.authorAvatar + '?size=256');
-
-    // Circular clip
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(
-      avatarX + AVATAR_SIZE / 2,
-      avatarY + AVATAR_SIZE / 2,
-      AVATAR_SIZE / 2,
-      0, Math.PI * 2,
-    );
-    ctx.closePath();
-    ctx.clip();
-    ctx.drawImage(avatarImg, avatarX, avatarY, AVATAR_SIZE, AVATAR_SIZE);
-    ctx.restore();
-
-    // Accent ring around avatar
-    ctx.beginPath();
-    ctx.arc(
-      avatarX + AVATAR_SIZE / 2,
-      avatarY + AVATAR_SIZE / 2,
-      AVATAR_SIZE / 2 + 3,
-      0, Math.PI * 2,
-    );
-    ctx.strokeStyle = scheme.accent;
-    ctx.lineWidth = 3;
-    ctx.stroke();
+    const img = await loadImage(state.authorAvatar + '?size=4096');
+    const scale = Math.max(AW / img.width, H / img.height);
+    const drawW = img.width * scale;
+    const drawH = img.height * scale;
+    ctx.drawImage(img, (AW - drawW) / 2, (H - drawH) / 2, drawW, drawH);
+    if (state.grayscale) applyGrayscale(ctx, 0, 0, AW, H);
   } catch {
-    // Avatar failed to load — draw a placeholder circle
-    ctx.beginPath();
-    ctx.arc(avatarX + AVATAR_SIZE / 2, avatarY + AVATAR_SIZE / 2, AVATAR_SIZE / 2, 0, Math.PI * 2);
-    ctx.fillStyle = scheme.accent + '44';
-    ctx.fill();
-    ctx.strokeStyle = scheme.accent;
-    ctx.lineWidth = 3;
-    ctx.stroke();
+    ctx.fillStyle = '#222';
+    ctx.fillRect(0, 0, AW, H);
   }
 
-  // ── Quote text ────────────────────────────────────────────
-  const textX     = avatarX + AVATAR_SIZE + 40;
-  const textMaxW  = WIDTH - textX - 60;
-  const fontSize  = state.content.length > 120 ? 26 : state.content.length > 60 ? 32 : 38;
-  const fontWeight = state.bold ? 'bold' : 'normal';
+  const fg = ctx.createLinearGradient(AW - FW, 0, AW + 40, 0);
+  fg.addColorStop(0, '#0a0a0a00');
+  fg.addColorStop(1, '#0a0a0aff');
+  ctx.fillStyle = fg;
+  ctx.fillRect(AW - FW, 0, FW + 40, H);
 
-  ctx.font        = `${fontWeight} ${fontSize}px serif`;
-  ctx.fillStyle   = scheme.text;
+  // LEFT-aligned text — never bleeds left or right
+  ctx.textAlign = 'left';
   ctx.textBaseline = 'top';
 
-  // Opening quote mark
-  ctx.font      = `bold ${fontSize * 2.5}px serif`;
-  ctx.fillStyle = scheme.accent + '44';
-  ctx.fillText('"', textX - 8, 55);
+  let fs = 80;
+  let lines: string[] = [];
+  let lh = fs * 1.3;
 
-  // Quote lines
-  ctx.font      = `${fontWeight} ${fontSize}px serif`;
-  ctx.fillStyle = scheme.text;
-  const lines   = wrapText(ctx, state.content, textMaxW);
-  const lineH   = fontSize * 1.45;
-  const totalH  = lines.length * lineH;
-  const startY  = HEIGHT / 2 - totalH / 2 - 20;
+  while (fs >= 14) {
+    ctx.font = `${state.bold ? '700' : '400'} ${fs}px sans-serif`;
+    lh = fs * 1.3;
+    lines = wrapText(ctx, state.content, TEXT_W);
+    const totalH = lines.length * lh;
+    if (totalH + 100 <= H - PAD_V * 2) break;
+    fs -= 1;
+  }
 
-  lines.forEach((line, i) => {
-    ctx.fillText(line, textX, startY + i * lineH);
-  });
+  ctx.fillStyle = '#ffffff';
+  const totalTextH = lines.length * lh;
+  const blockH = totalTextH + 100;
+  const startY = (H - blockH) / 2;
 
-  // ── Author name + handle ──────────────────────────────────
-  const authorY = startY + totalH + 28;
+  lines.forEach((line, i) => ctx.fillText(line, TEXT_X, startY + i * lh));
 
-  ctx.font      = `bold 20px sans-serif`;
-  ctx.fillStyle = scheme.accent;
-  ctx.fillText(`- ${state.authorName}`, textX, authorY);
+  // Author — left aligned under text
+  const authorY = startY + totalTextH + 20;
+  const nameFontSize = Math.max(32, Math.floor(fs * 0.42));
+  const handleFontSize = Math.max(24, Math.floor(fs * 0.32));
 
-  ctx.font      = `16px sans-serif`;
-  ctx.fillStyle = scheme.handle;
-  ctx.fillText(`@${state.authorHandle}`, textX, authorY + 28);
+  ctx.font = `italic 600 ${nameFontSize}px sans-serif`;
+  ctx.fillStyle = '#cccccc';
+  ctx.fillText(`- ${state.authorName}`, TEXT_X, authorY);
 
-  // ── Watermark ─────────────────────────────────────────────
-  ctx.font      = `13px sans-serif`;
-  ctx.fillStyle = '#ffffff18';
+  ctx.font = `400 ${handleFontSize}px sans-serif`;
+  ctx.fillStyle = '#777777';
+  ctx.fillText(`@${state.authorHandle}`, TEXT_X, authorY + nameFontSize + 6);
+
+  ctx.font = '400 13px sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
   ctx.textAlign = 'right';
-  ctx.fillText(`Quote`, WIDTH - 50, HEIGHT - 55);
-
-  return canvas.toBuffer('image/png');
+  ctx.textBaseline = 'bottom';
+  ctx.fillText('if you see this your mom gay lol', W - 18, H - 16);
 }
 
-// ── Button row builder ────────────────────────────────────────
+async function drawVertical(ctx: SKRSContext2D, state: QuoteState) {
+  const W = 630, H = 1200, AH = 560, FH = 280;
+  const TEXT_Y = 700;
+  const TEXT_H = H - TEXT_Y - 60;   // available vertical space for text
+  const TEXT_X = 60;
+  const TEXT_W = W - TEXT_X * 2;    // = 510px, padded both sides
+  const PAD_V = 50;
+
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fillRect(0, 0, W, H);
+
+  // Avatar — cover fit top portion
+  try {
+    const img = await loadImage(state.authorAvatar + '?size=4096');
+    const scale = Math.max(W / img.width, AH / img.height);
+    const drawW = img.width * scale;
+    const drawH = img.height * scale;
+    ctx.drawImage(img, (W - drawW) / 2, (AH - drawH) / 2, drawW, drawH);
+    if (state.grayscale) applyGrayscale(ctx, 0, 0, W, AH);
+  } catch {
+    ctx.fillStyle = '#222';
+    ctx.fillRect(0, 0, W, AH);
+  }
+
+  // Fade avatar → black (downward)
+  const fg = ctx.createLinearGradient(0, AH - FH, 0, AH + 40);
+  fg.addColorStop(0, '#0a0a0a00');
+  fg.addColorStop(1, '#0a0a0aff');
+  ctx.fillStyle = fg;
+  ctx.fillRect(0, AH - FH, W, FH + 40);
+
+  // Left-aligned text, auto-shrink
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+
+  let fs = 80;
+  let lines: string[] = [];
+  let lh = fs * 1.3;
+
+  while (fs >= 14) {
+    ctx.font = `${state.bold ? '700' : '400'} ${fs}px sans-serif`;
+    lh = fs * 1.3;
+    lines = wrapText(ctx, state.content, TEXT_W);
+    const totalH = lines.length * lh;
+    if (totalH + 100 <= TEXT_H) break;
+    fs -= 1;
+  }
+
+  ctx.fillStyle = '#ffffff';
+  const totalTextH = lines.length * lh;
+  const blockH = totalTextH + 100;
+  const startY = TEXT_Y + (TEXT_H - blockH) / 2;
+
+  lines.forEach((line, i) => ctx.fillText(line, TEXT_X, startY + i * lh));
+
+  // Author
+  const authorY = startY + totalTextH + 20;
+  const nameFontSize = Math.max(32, Math.floor(fs * 0.42));
+  const handleFontSize = Math.max(24, Math.floor(fs * 0.32));
+
+  ctx.font = `italic 600 ${nameFontSize}px sans-serif`;
+  ctx.fillStyle = '#cccccc';
+  ctx.fillText(`- ${state.authorName}`, TEXT_X, authorY);
+
+  ctx.font = `400 ${handleFontSize}px sans-serif`;
+  ctx.fillStyle = '#777777';
+  ctx.fillText(`@${state.authorHandle}`, TEXT_X, authorY + nameFontSize + 6);
+
+  ctx.font = '400 13px sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'bottom';
+  ctx.fillText('Quote', W - 18, H - 16);
+}
 
 function buildButtons(state: QuoteState): ActionRowBuilder<ButtonBuilder> {
-  const bg     = BG_STYLES[state.bgStyle % BG_STYLES.length];
-  const scheme = COLOR_SCHEMES[state.colorScheme % COLOR_SCHEMES.length];
-
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId('quote_bg')
-      .setEmoji('🎨')
-      .setStyle(ButtonStyle.Secondary)
-      .setLabel(bg.name),
-    new ButtonBuilder()
-      .setCustomId('quote_color')
-      .setEmoji('🌈')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId('quote_regen')
-      .setEmoji('🔄')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId('quote_bold')
-      .setLabel('B')
-      .setStyle(state.bold ? ButtonStyle.Primary : ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId('quote_new')
-      .setLabel('New Quote')
-      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('quote_grayscale')
+      .setLabel(state.grayscale?'🎨 Color':'⬛ B&W').setStyle(state.grayscale?ButtonStyle.Primary:ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('quote_orientation')
+      .setLabel(state.vertical?'↔️ Horizontal':'↕️ Vertical').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('quote_bold')
+      .setLabel('B').setStyle(state.bold?ButtonStyle.Primary:ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('quote_regen').setEmoji('🔄').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('quote_new').setLabel('New Quote').setStyle(ButtonStyle.Success),
   );
 }
 
-// ── Send/update quote message ─────────────────────────────────
-
-async function sendQuote(
-  target: Message | ButtonInteraction,
-  state: QuoteState,
-  edit = false,
-): Promise<void> {
-  const buffer     = await generateQuoteImage(state);
-  const attachment = new AttachmentBuilder(buffer, { name: 'quote.png' });
-  const buttons    = buildButtons(state);
-
-  const payload = {
-    files: [attachment],
-    components: [buttons],
-  };
-
-  if (edit && target instanceof ButtonInteraction) {
-    await target.update(payload as any);
-  } else if (target instanceof ButtonInteraction) {
-    await target.reply(payload as any);
-  } else {
-    await target.reply(payload as any);
-  }
-}
-
-// ── Fetch a random recent message from a user ─────────────────
-
-async function fetchRandomUserMessage(
-  originalMessage: Message,
-  userId: string,
-): Promise<string | null> {
+async function fetchRandomUserMessage(source: Message, userId: string): Promise<string|null> {
   try {
-    const messages = await originalMessage.channel.messages.fetch({ limit: 100 });
-    const userMsgs = messages.filter(
-      (m) =>
-        m.author.id === userId &&
-        m.id !== originalMessage.id &&
-        m.content.length > 10 &&
-        !m.content.startsWith('/'),
-    );
-    if (!userMsgs.size) return null;
-    const arr = [...userMsgs.values()];
-    return arr[Math.floor(Math.random() * arr.length)].content;
-  } catch {
-    return null;
-  }
+    const msgs=await source.channel.messages.fetch({limit:100});
+    const f=msgs.filter(m=>m.author.id===userId&&m.id!==source.id&&m.content.length>10&&!m.content.startsWith('/'));
+    if (!f.size) return null;
+    const arr=[...f.values()]; return arr[Math.floor(Math.random()*arr.length)].content;
+  } catch { return null; }
 }
 
-// ── State store (in-memory, keyed by quote message ID) ────────
-const quoteStates = new Map<string, QuoteState>();
+const quoteStates=new Map<string,QuoteState>();
 
-// ── Handle @mention trigger ───────────────────────────────────
-
-export async function handleQuoteMention(
-  message: Message,
-  client: Client,
-): Promise<void> {
-  // Only act if the bot is mentioned
+export async function handleQuoteMention(message: Message, client: Client): Promise<void> {
   if (!message.mentions.has(client.user!.id)) return;
-  // Must be a reply to another message
   if (!message.reference?.messageId) return;
-
   try {
-    const quoted = await message.channel.messages.fetch(message.reference.messageId);
-    if (!quoted.content || quoted.content.length < 2) {
-      await message.reply({ content: '❌ That message has no text to quote.' });
+    const quoted=await message.channel.messages.fetch(message.reference.messageId);
+    if (!quoted.content||quoted.content.length<2) { await message.reply({content:'❌ That message has no text.'}); return; }
+    const member=message.guild?await message.guild.members.fetch(quoted.author.id).catch(()=>null):null;
+    const state: QuoteState = {
+      authorId:quoted.author.id, authorName:member?.displayName??quoted.author.displayName,
+      authorHandle:quoted.author.username, authorAvatar:quoted.author.displayAvatarURL({extension:'png',size:4096}),
+      content:quoted.content, grayscale:false, vertical:false, bold:false,
+      guildId:message.guild?.id??'', channelId:message.channelId,
+    };
+    const buffer=await generateQuoteImage(state);
+    const sent=await message.reply({files:[new AttachmentBuilder(buffer,{name:'quote.png'})],components:[buildButtons(state)]});
+    quoteStates.set(sent.id,state);
+    setupButtonCollector(sent,state,message);
+  } catch(err:unknown) { console.error('[quote]',err instanceof Error?err.message:String(err)); }
+}
+
+function setupButtonCollector(quoteMsg: Message, initial: QuoteState, source: Message) {
+  const collector=quoteMsg.createMessageComponentCollector({componentType:ComponentType.Button,time:30*60*1000});
+  collector.on('collect',async(interaction:ButtonInteraction)=>{
+    if (interaction.user.id !== source.author.id) {
+      await interaction.reply({ content: '❌ Only the person who requested this quote can use these buttons.', ephemeral: true });
       return;
     }
+    const state=quoteStates.get(quoteMsg.id)??initial;
+    const next={...state};
+    switch(interaction.customId) {
+      case 'quote_grayscale': next.grayscale=!state.grayscale; break;
+      case 'quote_orientation': next.vertical=!state.vertical; break;
+      case 'quote_bold': next.bold=!state.bold; break;
+      case 'quote_regen': break;
+      case 'quote_new': {
+        const nc=await fetchRandomUserMessage(source,state.authorId);
+        if (!nc) { await interaction.reply({content:"❌ No other messages found.",ephemeral:true}); return; }
+        next.content=nc; break;
+      }
+      default: return;
+    }
+    quoteStates.set(quoteMsg.id,next);
+    try {
+      const buf=await generateQuoteImage(next);
+      await interaction.update({files:[new AttachmentBuilder(buf,{name:'quote.png'})],components:[buildButtons(next)]} as any);
+    } catch(err:unknown) { await interaction.reply({content:`❌ ${err instanceof Error?err.message:String(err)}`,ephemeral:true}); }
+  });
+  collector.on('end',async()=>{
+    quoteStates.delete(quoteMsg.id);
+    try {
+      const disabled=new ActionRowBuilder<ButtonBuilder>().addComponents(
+        buildButtons(initial).components.map(b=>ButtonBuilder.from(b as any).setDisabled(true)));
+      await quoteMsg.edit({components:[disabled]});
+    } catch {}
+  });
+}
+export async function generateQuoteImage(state: QuoteState): Promise<Buffer> {
+  const W = state.vertical ? 630 : 1200;
+  const H = state.vertical ? 1200 : 630;
 
-    const member = message.guild
-      ? await message.guild.members.fetch(quoted.author.id).catch(() => null)
-      : null;
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext('2d');
 
-    const state: QuoteState = {
-      authorId:     quoted.author.id,
-      authorName:   member?.displayName ?? quoted.author.displayName,
-      authorHandle: quoted.author.username,
-      authorAvatar: quoted.author.displayAvatarURL({ extension: 'png', size: 256 }),
-      content:      quoted.content,
-      bgStyle:      0,
-      colorScheme:  0,
-      bold:         false,
-      guildId:      message.guild?.id ?? '',
-      channelId:    message.channelId,
-    };
+  roundRect(ctx, 0, 0, W, H, RADIUS);
+  ctx.clip();
 
-    const sent = await message.reply({
-      content: '',
-      files: [new AttachmentBuilder(await generateQuoteImage(state), { name: 'quote.png' })],
-      components: [buildButtons(state)],
-    });
-
-    quoteStates.set(sent.id, state);
-    setupButtonCollector(sent, state, message);
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error('[quote] mention error:', msg);
+  if (state.vertical) {
+    await drawVertical(ctx, state);
+  } else {
+    await drawHorizontal(ctx, state);
   }
+  if (!state.vertical) {
+  roundRect(ctx, 0, 0, W, H, RADIUS);
+  ctx.clip();
 }
 
-// ── Button collector ──────────────────────────────────────────
-
-function setupButtonCollector(
-  quoteMessage: Message,
-  initialState: QuoteState,
-  sourceMessage: Message,
-): void {
-  const collector = quoteMessage.createMessageComponentCollector({
-    componentType: ComponentType.Button,
-    time: 30 * 60 * 1000, // 30 minutes
-  });
-
-  collector.on('collect', async (interaction: ButtonInteraction) => {
-    const state = quoteStates.get(quoteMessage.id) ?? initialState;
-    const next  = { ...state };
-
-    switch (interaction.customId) {
-      case 'quote_bg':
-        next.bgStyle = (state.bgStyle + 1) % BG_STYLES.length;
-        break;
-
-      case 'quote_color':
-        next.colorScheme = (state.colorScheme + 1) % COLOR_SCHEMES.length;
-        break;
-
-      case 'quote_bold':
-        next.bold = !state.bold;
-        break;
-
-      case 'quote_regen':
-        // Rebuild with same settings
-        break;
-
-      case 'quote_new': {
-        const newContent = await fetchRandomUserMessage(sourceMessage, state.authorId);
-        if (!newContent) {
-          await interaction.reply({
-            content: "❌ Couldn't find another message from that user in recent history.",
-            ephemeral: true,
-          });
-          return;
-        }
-        next.content = newContent;
-        break;
-      }
-
-      default:
-        return;
-    }
-
-    quoteStates.set(quoteMessage.id, next);
-
-    try {
-      const buffer     = await generateQuoteImage(next);
-      const attachment = new AttachmentBuilder(buffer, { name: 'quote.png' });
-      const buttons    = buildButtons(next);
-      await interaction.update({ files: [attachment], components: [buttons] } as any);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await interaction.reply({ content: `❌ Failed to update: ${msg}`, ephemeral: true });
-    }
-  });
-
-  collector.on('end', async () => {
-    quoteStates.delete(quoteMessage.id);
-    // Disable buttons after 30 minutes
-    try {
-      const disabledRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        buildButtons(initialState).components.map((b) =>
-          ButtonBuilder.from(b as any).setDisabled(true),
-        ),
-      );
-      await quoteMessage.edit({ components: [disabledRow] });
-    } catch { /* message may have been deleted */ }
-  });
+  return canvas.toBuffer('image/png');
 }
