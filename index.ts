@@ -19,13 +19,31 @@ import {
   loadAutoDeleteRules,
 } from './features/autodelete';
 import {
+  boosterCommand,
+  boosterAdminCommand,
+  handleBoosterInteraction,
+  handleBoosterAdminInteraction,
+  handleBoostChange,
+} from './features/booster';
+import {
   modLogCommand,
   handleModLogInteraction,
   logNewMessage,
   logDeletedMessage,
+  logEditedMessage,
   logBulkDelete,
+  logMemberJoin,
+  logMemberLeave,
+  logRoleUpdate,
   loadModLogConfigs,
 } from './features/modlog';
+import { handleQuoteMention } from './features/quote';
+import {
+  setupRoleCommand,
+  handleSetupRoleInteraction,
+  checkAdminRole,
+  loadAdminRoles,
+} from './utils/rolecheck';
 
 const client = new Client({
   intents: [
@@ -33,6 +51,7 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
   ],
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
@@ -40,45 +59,45 @@ const client = new Client({
 // ── Command collection ────────────────────────────────────────
 const commands = new Collection<string, any>();
 commands.set(starboardCommand.data.name, starboardCommand);
-// autodelete is handled directly via handleAutoDeleteInteraction,
-// so it doesn't need an entry in the collection.
 
 // ── Ready ─────────────────────────────────────────────────────
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user?.tag}`);
 
-  // Register ALL slash commands in one PUT call
   const rest = new REST().setToken(process.env.BOT_TOKEN!);
   await rest.put(
-    Routes.applicationGuildCommands(process.env.CLIENT_ID!, process.env.GUILD_ID!),
+    Routes.applicationCommands(process.env.CLIENT_ID!),
     {
       body: [
         starboardCommand.data.toJSON(),
         autoDeleteCommand.toJSON(),
-        modLogCommand.toJSON(),         // ← modlog registered
+        modLogCommand.toJSON(),
+        boosterCommand.toJSON(),
+        boosterAdminCommand.toJSON(),
+        setupRoleCommand.toJSON(),        // ← /setuprole registered
       ],
     },
   );
   console.log('✅ Slash commands registered');
 
   setupStarboard(client);
-  await loadAutoDeleteRules();  // ← restore autodelete rules from DB
-  loadModLogConfigs();           // ← restore mod-log config from DB
-  startSweepLoop(client);               // ← starts the 60s sweep loop
+  loadAdminRoles();                       // ← load role config first
+  await loadAutoDeleteRules();
+  loadModLogConfigs();
+  startSweepLoop(client);
 });
 
 // ── Messages ──────────────────────────────────────────────────
 client.on('messageCreate', (message) => {
-  handleMessage(message);       // auto-delete scheduling
-  if (!message.partial) logNewMessage(message);  // mod-log on send
+  handleMessage(message);
+  if (!message.partial) logNewMessage(message);
+  if (!message.partial && message.mentions.users.size > 0) handleQuoteMention(message, client);
 });
 
-// Log individually deleted messages to mod-log
 client.on('messageDelete', (message) => {
   logDeletedMessage(message);
 });
 
-// Log bulk deletes (e.g. from /autodelete purge)
 client.on('messageDeleteBulk', (messages, channel) => {
   logBulkDelete(messages, channel as TextChannel);
 });
@@ -87,21 +106,65 @@ client.on('messageDeleteBulk', (messages, channel) => {
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  // Route /autodelete to its own handler
-  if (interaction.commandName === 'autodelete') {
+  const cmd = interaction.commandName;
+
+  // /setuprole — only needs ManageGuild (handled inside the command itself)
+  if (cmd === 'setuprole') {
+    await handleSetupRoleInteraction(interaction);
+    return;
+  }
+
+  // /booster — open to all, but internally checks if user is a booster
+  if (cmd === 'booster') {
+    await handleBoosterInteraction(interaction, client);
+    return;
+  }
+
+  // Everything below requires the admin role ─────────────────
+
+  if (cmd === 'autodelete') {
+    if (!await checkAdminRole(interaction)) return;
     await handleAutoDeleteInteraction(interaction);
     return;
   }
 
-  if (interaction.commandName === 'modlog') {
+  if (cmd === 'modlog') {
+    if (!await checkAdminRole(interaction)) return;
     await handleModLogInteraction(interaction);
     return;
   }
 
-  // All other commands go through the collection
-  const command = commands.get(interaction.commandName);
+  if (cmd === 'boosteradmin') {
+    if (!await checkAdminRole(interaction)) return;
+    await handleBoosterAdminInteraction(interaction, client);
+    return;
+  }
+
+  // Starboard and any other collection commands
+  const command = commands.get(cmd);
   if (!command) return;
+  if (!await checkAdminRole(interaction)) return;
   await command.execute(interaction as ChatInputCommandInteraction);
+});
+
+// Log edited messages
+client.on('messageUpdate', (oldMessage, newMessage) => {
+  logEditedMessage(oldMessage, newMessage);
+});
+
+// Log member join / leave
+client.on('guildMemberAdd', (member) => {
+  logMemberJoin(member as any);
+});
+
+client.on('guildMemberRemove', (member) => {
+  logMemberLeave(member as any);
+});
+
+// ── Boost detection ───────────────────────────────────────────
+client.on('guildMemberUpdate', (oldMember, newMember) => {
+  handleBoostChange(oldMember as any, newMember as any, client);
+  logRoleUpdate(oldMember as any, newMember as any);
 });
 
 client.login(process.env.BOT_TOKEN);

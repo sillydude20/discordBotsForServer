@@ -18,3 +18,4 @@ Star board
 Quote 
 Swaffy  f 
 
+logging edited messages and joins/ updates
