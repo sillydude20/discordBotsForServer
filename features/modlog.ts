@@ -38,6 +38,46 @@ import {
   deleteLogMessageMap,
 } from '../utils/database';
 
+import { request } from 'undici'; // already available in Node 18+
+
+interface LinkPreview {
+  title?: string;
+  description?: string;
+  image?: string;
+  siteName?: string;
+}
+
+async function fetchLinkPreview(url: string): Promise<LinkPreview | null> {
+  try {
+    const { body, headers } = await request(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; DiscordBot/1.0)' },
+      maxRedirections: 3,
+    });
+    const contentType = headers['content-type'] ?? '';
+    if (!contentType.includes('text/html')) return null;
+
+    const html = await body.text();
+    const get = (prop: string) => {
+      const match = html.match(new RegExp(`<meta[^>]+(?:property|name)=["']${prop}["'][^>]+content=["']([^"']+)["']`, 'i'))
+        ?? html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${prop}["']`, 'i'));
+      return match?.[1];
+    };
+
+    return {
+      title:       get('og:title')       ?? get('twitter:title'),
+      description: get('og:description') ?? get('twitter:description'),
+      image:       get('og:image')       ?? get('twitter:image'),
+      siteName:    get('og:site_name'),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function extractUrls(text: string): string[] {
+  return [...text.matchAll(/https?:\/\/[^\s<>)"]+/g)].map(m => m[0]).slice(0, 3); // max 3
+}
+
 // ── Types ─────────────────────────────────────────────────────
 
 interface ModLogConfig {
@@ -311,6 +351,16 @@ async function buildSentEmbed(message: Message): Promise<EmbedBuilder> {
     const image = message.attachments.find((a) => a.contentType?.startsWith('image/'));
     if (image) embed.setImage(image.url);
   }
+ if (message.embeds?.length > 0) {
+  for (const discordEmbed of message.embeds) {
+    const image = discordEmbed.image?.url ?? discordEmbed.thumbnail?.url;
+    if (image) {
+      embed.setImage(image);
+      if (discordEmbed.title) embed.addFields({ name: '🔗 ' + (discordEmbed.provider?.name ?? 'Link'), value: discordEmbed.title.slice(0, 1024) });
+      break;
+    }
+  }
+}
 
   return embed;
 }
