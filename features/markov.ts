@@ -109,42 +109,53 @@ function generateText(guildId: string): string | null {
   }
 }
 
-// ── Handle incoming messages ──────────────────────────────────
-// Add near the top with other in-memory stores
-export const markovMsgIds = new Set<string>(); // tracks bot markov message IDs
+// ── Track bot markov message IDs ──────────────────────────────
+export const markovMsgIds = new Set<string>();
 
+// ── Handle incoming messages ──────────────────────────────────
 export async function handleMarkovMessage(message: Message, client: Client): Promise<void> {
   if (message.author.bot) return;
   if (!message.guild) return;
-  if (!message.content || message.content.length < 5) return;
   if (message.content.startsWith('/')) return;
 
-  // If replying to a bot message
+  // ── Reply-to-bot logic (checked BEFORE length gate) ──────────
   if (message.reference?.messageId) {
     try {
       const repliedTo = await message.channel.messages.fetch(message.reference.messageId);
       if (repliedTo.author.id === client.user!.id) {
-        const isMarkovMsg = markovMsgIds.has(repliedTo.id) || (repliedTo.embeds.length === 0 && repliedTo.components.length === 0);
-        if (isMarkovMsg) {
-          // Don't respond if the user also @mentioned the bot — quote handler takes that
-          if (!message.mentions.has(client.user!.id)) {
-            const generated = generateText(message.guild.id);
-            if (generated) {
-              const sent = await message.reply(generated);
-              markovMsgIds.add(sent.id); // track this new reply too
-            }
-          }
-        }
-        // Store message if channel is enabled
-        if (enabledChannels.has(message.channelId)) {
+        // Treat as a markov message if:
+        // 1. It's tracked in markovMsgIds (current session), OR
+        // 2. It's plain text with no embeds/components (survives bot restarts)
+        const isMarkovMsg =
+          markovMsgIds.has(repliedTo.id) ||
+          (repliedTo.embeds.length === 0 &&
+           repliedTo.components.length === 0 &&
+           repliedTo.content.length > 0);
+
+        // Only save the reply if it's long enough to be useful training data
+        if (enabledChannels.has(message.channelId) && message.content.length >= 5) {
           saveMessage(message.guild.id, message.channelId, message.content);
         }
+
+        // Reply with generated text unless the user also @mentioned the bot
+        // (in that case the quote handler takes over)
+        if (isMarkovMsg && !message.mentions.has(client.user!.id)) {
+          const generated = generateText(message.guild.id);
+          if (generated) {
+            const sent = await message.reply(generated);
+            markovMsgIds.add(sent.id);
+          }
+        }
+
         return;
       }
-    } catch { /* fetch failed, continue */ }
+    } catch { /* fetch failed, fall through */ }
   }
 
-  // Normal flow — only enabled channels
+  // ── Length gate (only applies to saving + auto-interval) ─────
+  if (!message.content || message.content.length < 5) return;
+
+  // ── Normal flow — only enabled channels ──────────────────────
   if (!enabledChannels.has(message.channelId)) return;
 
   saveMessage(message.guild.id, message.channelId, message.content);
@@ -159,7 +170,7 @@ export async function handleMarkovMessage(message: Message, client: Client): Pro
       const generated = generateText(message.guild.id);
       if (generated) {
         const sent = await (message.channel as TextChannel).send(generated);
-        markovMsgIds.add(sent.id); // track auto-generated messages too
+        markovMsgIds.add(sent.id);
       }
     }
   }
@@ -213,9 +224,7 @@ export const markovCommand = new SlashCommandBuilder()
   );
 
 // ── Interaction handler ───────────────────────────────────────
-export async function handleMarkovInteraction(
-  interaction: ChatInputCommandInteraction,
-): Promise<void> {
+export async function handleMarkovInteraction(interaction: ChatInputCommandInteraction,): Promise<void> {
   if (interaction.commandName !== 'markov') return;
   if (!interaction.guild) return;
 
@@ -286,7 +295,6 @@ export async function handleMarkovInteraction(
   if (sub === 'import') {
     await interaction.deferReply({ ephemeral: true });
 
-    // Get which channels are enabled for this guild
     const enabledForGuild = getEnabledChannelsForGuild(interaction.guild.id);
 
     if (enabledForGuild.length === 0) {
@@ -294,13 +302,11 @@ export async function handleMarkovInteraction(
       return;
     }
 
-    // Build a set of already-stored content to avoid duplicates
     const existing = new Set(
       (db.prepare('SELECT content FROM markov_messages WHERE guild_id = ?')
         .all(interaction.guild.id) as any[]).map(r => r.content),
     );
 
-    // Pull from modlog_message_cache, only from enabled channels
     const placeholders = enabledForGuild.map(() => '?').join(', ');
     const rows = (db.prepare(`
       SELECT channel_id, content FROM modlog_message_cache
@@ -324,18 +330,16 @@ export async function handleMarkovInteraction(
 
     const importMany = db.transaction((rows: any[]) => {
       for (const row of rows) {
-        // Skip if content already stored (dedup by content)
         if (existing.has(row.content)) {
           skipped++;
           continue;
         }
-        // Skip bot commands and very short messages
         if (row.content.startsWith('/')) {
           skipped++;
           continue;
         }
         insert.run(interaction.guild!.id, row.channel_id, row.content);
-        existing.add(row.content); // prevent dupes within this batch too
+        existing.add(row.content);
         imported++;
       }
     });
