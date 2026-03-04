@@ -351,17 +351,13 @@ export async function handleQuoteMention(message: Message, client: Client): Prom
   if (!message.mentions.has(client.user!.id)) return;
   if (!message.reference?.messageId) return;
 
-  if (quoteMsgIds.has(message.reference.messageId)) return;
-
-  // Don't re-trigger if someone replies to a quote the bot already made
-  if (quoteMsgIds.has(message.reference.messageId)) return;
-
   try {
     const repliedTo = await message.channel.messages.fetch(message.reference.messageId);
+    if (repliedTo.author.id === client.user!.id) return;
 
     if (repliedTo.author.bot) {
       // Replace the repliedTo.author.bot check with this:
-if (repliedTo.author.bot) {
+  if (repliedTo.author.bot) {
   // If it's a markov message, quote it directly
   if (markovMsgIds.has(repliedTo.id) && repliedTo.content?.length >= 2) {
     const state: QuoteState = {

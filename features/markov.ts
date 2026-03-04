@@ -123,16 +123,9 @@ export async function handleMarkovMessage(message: Message, client: Client): Pro
   if (message.reference?.messageId) {
     try {
       const repliedTo = await message.channel.messages.fetch(message.reference.messageId);
-      // DEBUG
-    console.log(`[markov] reply detected`);
-    console.log(`[markov] repliedTo author: ${repliedTo.author.id}`);
-    console.log(`[markov] bot id: ${client.user!.id}`);
-    console.log(`[markov] is bot message: ${repliedTo.author.id === client.user!.id}`);
-    console.log(`[markov] in markovMsgIds: ${markovMsgIds.has(repliedTo.id)}`);
-    console.log(`[markov] markovMsgIds size: ${markovMsgIds.size}`);
       if (repliedTo.author.id === client.user!.id) {
-        // Only respond if it was a markov message, not a quote or command response
-        if (markovMsgIds.has(repliedTo.id)) {
+        const isMarkovMsg = markovMsgIds.has(repliedTo.id) || (repliedTo.embeds.length === 0 && repliedTo.components.length === 0);
+        if (isMarkovMsg) {
           // Don't respond if the user also @mentioned the bot — quote handler takes that
           if (!message.mentions.has(client.user!.id)) {
             const generated = generateText(message.guild.id);

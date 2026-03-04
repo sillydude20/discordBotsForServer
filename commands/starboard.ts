@@ -60,10 +60,6 @@ export const data = new SlashCommandBuilder()
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   // Server owner only
-  if (interaction.user.id !== interaction.guild?.ownerId) {
-    await interaction.reply({ content: "❌ Only the server owner can use this command.", ephemeral: true });
-    return;
-  }
 
   const guildId = interaction.guildId!;
   const sub = interaction.options.getSubcommand();

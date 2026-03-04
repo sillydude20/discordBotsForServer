@@ -19,3 +19,8 @@ Quote - need to work on emojis actually showing up - only reply with a quote if 
 Swaffy  f 
 
 logging edited messages and joins/ updates
+
+
+
+
+
