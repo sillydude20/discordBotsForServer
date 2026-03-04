@@ -7,6 +7,8 @@
 //   /modlog ignore #channel — stop logging messages from a channel
 //   /modlog unignore #channel
 //   /modlog ignorelist      — show all ignored channels
+//   /modlog setcommandlog   — set a separate channel for command usage logs
+//   /modlog removecommandlog — remove the separate command log channel
 // ─────────────────────────────────────────────────────────────
 
 import {
@@ -36,9 +38,12 @@ import {
   getLogMessageMap,
   saveLogMessageMap,
   deleteLogMessageMap,
+  getCmdLogConfig,
+  saveCmdLogConfig,
+  deleteCmdLogConfig,
 } from '../utils/database';
 
-import { request } from 'undici'; // already available in Node 18+
+import { request } from 'undici';
 
 interface LinkPreview {
   title?: string;
@@ -75,7 +80,7 @@ async function fetchLinkPreview(url: string): Promise<LinkPreview | null> {
 }
 
 function extractUrls(text: string): string[] {
-  return [...text.matchAll(/https?:\/\/[^\s<>)"]+/g)].map(m => m[0]).slice(0, 3); // max 3
+  return [...text.matchAll(/https?:\/\/[^\s<>)"]+/g)].map(m => m[0]).slice(0, 3);
 }
 
 // ── Types ─────────────────────────────────────────────────────
@@ -85,12 +90,13 @@ interface ModLogConfig {
   channelId: string;
 }
 
-// ── In-memory stores (all loaded from DB on startup) ──────────
+// ── In-memory stores ──────────────────────────────────────────
 
-const modLogConfigs    = new Map<string, ModLogConfig>();   // guildId → config
-const ignoredChannels  = new Map<string, Set<string>>();    // guildId → Set<channelId>
-const logMessageMap    = new Map<Snowflake, Snowflake>();   // originalMsgId → logMsgId
-const messageCache     = new Map<Snowflake, CachedMessage>(); // msgId → content
+const modLogConfigs    = new Map<string, ModLogConfig>(); // guildId → config
+const cmdLogConfigs    = new Map<string, string>();        // guildId → channelId
+const ignoredChannels  = new Map<string, Set<string>>();  // guildId → Set<channelId>
+const logMessageMap    = new Map<Snowflake, Snowflake>();  // originalMsgId → logMsgId
+const messageCache     = new Map<Snowflake, CachedMessage>();
 
 interface CachedMessage {
   authorId: string;
@@ -109,11 +115,18 @@ const MAX_CACHE = 10_000;
 // ── Load everything from DB on startup ───────────────────────
 
 export function loadModLogConfigs(): void {
-  // Configs
+  // Mod-log configs
   const configRows = getModLogConfig();
   modLogConfigs.clear();
   for (const row of configRows) {
     modLogConfigs.set(row.guildId, { guildId: row.guildId, channelId: row.channelId });
+  }
+
+  // Command log configs
+  const cmdLogRows = getCmdLogConfig();
+  cmdLogConfigs.clear();
+  for (const row of cmdLogRows) {
+    cmdLogConfigs.set(row.guildId, row.channelId);
   }
 
   // Ignored channels
@@ -124,7 +137,7 @@ export function loadModLogConfigs(): void {
     ignoredChannels.get(row.guildId)!.add(row.channelId);
   }
 
-  // Message cache (content stored between restarts)
+  // Message cache
   const cacheRows = getCachedMessages();
   messageCache.clear();
   for (const row of cacheRows) {
@@ -141,7 +154,7 @@ export function loadModLogConfigs(): void {
     });
   }
 
-  // Log message map (originalId → logId)
+  // Log message map
   const mapRows = getLogMessageMap();
   logMessageMap.clear();
   for (const row of mapRows) {
@@ -150,6 +163,7 @@ export function loadModLogConfigs(): void {
 
   console.log(
     `📦 Loaded ${modLogConfigs.size} mod-log config(s), ` +
+    `${cmdLogConfigs.size} command-log config(s), ` +
     `${messageCache.size} cached message(s) from database`,
   );
 }
@@ -191,6 +205,17 @@ export const modLogCommand = new SlashCommandBuilder()
   )
   .addSubcommand((sub) =>
     sub.setName('ignorelist').setDescription('List all channels excluded from logging'),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('setcommandlog')
+      .setDescription('Set a separate channel for command usage logs')
+      .addChannelOption((opt) =>
+        opt.setName('channel').setDescription('Channel to log commands to').setRequired(true),
+      ),
+  )
+  .addSubcommand((sub) =>
+    sub.setName('removecommandlog').setDescription('Remove the separate command log channel (falls back to main mod-log)'),
   );
 
 // ── Interaction handler ───────────────────────────────────────
@@ -259,8 +284,9 @@ export async function handleModLogInteraction(
 
   // /modlog status
   if (sub === 'status') {
-    const config  = modLogConfigs.get(interaction.guild.id);
-    const ignored = ignoredChannels.get(interaction.guild.id);
+    const config     = modLogConfigs.get(interaction.guild.id);
+    const cmdLogId   = cmdLogConfigs.get(interaction.guild.id);
+    const ignored    = ignoredChannels.get(interaction.guild.id);
 
     if (!config) {
       await interaction.reply({ content: 'ℹ️ Mod-log is not configured. Use `/modlog set` to enable it.', ephemeral: true });
@@ -271,8 +297,15 @@ export async function handleModLogInteraction(
       ? [...ignored].map((id) => `<#${id}>`).join(', ')
       : '*None*';
 
+    const cmdLogLine = cmdLogId
+      ? `\n⚙️ Command log channel: <#${cmdLogId}>`
+      : `\n⚙️ Command log channel: *same as mod-log*`;
+
     await interaction.reply({
-      content: `📋 Mod-log active → <#${config.channelId}>\n🔇 Ignored channels: ${ignoredList}`,
+      content:
+        `📋 Mod-log active → <#${config.channelId}>` +
+        cmdLogLine +
+        `\n🔇 Ignored channels: ${ignoredList}`,
       ephemeral: true,
     });
     return;
@@ -306,6 +339,27 @@ export async function handleModLogInteraction(
     }
     const list = [...ignored].map((id) => `• <#${id}>`).join('\n');
     await interaction.reply({ content: `**Ignored channels (${ignored.size}):**\n${list}`, ephemeral: true });
+    return;
+  }
+
+  // /modlog setcommandlog
+  if (sub === 'setcommandlog') {
+    const channel = interaction.options.getChannel('channel', true);
+    cmdLogConfigs.set(interaction.guild.id, channel.id);
+    saveCmdLogConfig(interaction.guild.id, channel.id);
+    await interaction.reply({ content: `✅ Command log set to <#${channel.id}>.`, ephemeral: true });
+    return;
+  }
+
+  // /modlog removecommandlog
+  if (sub === 'removecommandlog') {
+    cmdLogConfigs.delete(interaction.guild.id);
+    deleteCmdLogConfig(interaction.guild.id);
+    await interaction.reply({
+      content: '🗑 Command log channel removed. Commands will now log to the main mod-log.',
+      ephemeral: true,
+    });
+    return;
   }
 }
 
@@ -326,9 +380,9 @@ async function buildSentEmbed(message: Message): Promise<EmbedBuilder> {
 
   if (message.reference?.messageId) {
     try {
-      const repliedTo    = await message.channel.messages.fetch(message.reference.messageId);
+      const repliedTo     = await message.channel.messages.fetch(message.reference.messageId);
       const repliedMember = await message.guild!.members.fetch(repliedTo.author.id);
-      const replyContent = repliedTo.content || '*No text content*';
+      const replyContent  = repliedTo.content || '*No text content*';
       embed.addFields({
         name: `↩️ Replying to ${repliedMember.displayName}`,
         value: replyContent.length > 1024 ? replyContent.slice(0, 1021) + '...' : replyContent,
@@ -351,16 +405,17 @@ async function buildSentEmbed(message: Message): Promise<EmbedBuilder> {
     const image = message.attachments.find((a) => a.contentType?.startsWith('image/'));
     if (image) embed.setImage(image.url);
   }
- if (message.embeds?.length > 0) {
-  for (const discordEmbed of message.embeds) {
-    const image = discordEmbed.image?.url ?? discordEmbed.thumbnail?.url;
-    if (image) {
-      embed.setImage(image);
-      if (discordEmbed.title) embed.addFields({ name: '🔗 ' + (discordEmbed.provider?.name ?? 'Link'), value: discordEmbed.title.slice(0, 1024) });
-      break;
+
+  if (message.embeds?.length > 0) {
+    for (const discordEmbed of message.embeds) {
+      const image = discordEmbed.image?.url ?? discordEmbed.thumbnail?.url;
+      if (image) {
+        embed.setImage(image);
+        if (discordEmbed.title) embed.addFields({ name: '🔗 ' + (discordEmbed.provider?.name ?? 'Link'), value: discordEmbed.title.slice(0, 1024) });
+        break;
+      }
     }
   }
-}
 
   return embed;
 }
@@ -387,7 +442,7 @@ async function buildDeletedEmbed(
 
   if (cached.replyToId) {
     try {
-      const ch = await guild.channels.fetch(cached.channelId).catch(() => null);
+      const ch        = await guild.channels.fetch(cached.channelId).catch(() => null);
       const repliedTo = ch?.isTextBased()
         ? await (ch as TextChannel).messages.fetch(cached.replyToId).catch(() => null)
         : null;
@@ -433,7 +488,6 @@ export async function logNewMessage(message: Message): Promise<void> {
   const config = modLogConfigs.get(message.guild.id);
   if (!config) return;
 
-  // Skip mod-log channel itself and any ignored channels
   if (message.channelId === config.channelId) return;
   if (ignoredChannels.get(message.guild.id)?.has(message.channelId)) return;
 
@@ -444,7 +498,6 @@ export async function logNewMessage(message: Message): Promise<void> {
     const embed  = await buildSentEmbed(message);
     const logMsg = await (logChannel as TextChannel).send({ embeds: [embed] });
 
-    // Persist both the log map and the message cache to DB
     logMessageMap.set(message.id, logMsg.id);
     saveLogMessageMap(message.id, logMsg.id);
 
@@ -464,7 +517,6 @@ export async function logNewMessage(message: Message): Promise<void> {
     messageCache.set(message.id, cacheEntry);
     saveCachedMessage(message.id, cacheEntry);
 
-    // Evict oldest in-memory entry if over limit
     if (messageCache.size > MAX_CACHE) {
       messageCache.delete(messageCache.keys().next().value!);
     }
@@ -495,19 +547,46 @@ export async function logDeletedMessage(
     const logEntry = await (logChannel as TextChannel).messages.fetch(logEntryId).catch(() => null);
     if (!logEntry) return;
 
+    // Wait 1.5s for Discord's audit log to populate
+    await new Promise((res) => setTimeout(res, 1500));
+
+    // Check audit log for who deleted it
+    let deletedBy: string | null = null;
+    let deletedBySelf = false;
+    try {
+      const auditLogs = await message.guild.fetchAuditLogs({
+        type: 72, // MESSAGE_DELETE action type
+        limit: 5,
+      });
+
+      const entry = auditLogs.entries.find((e) => {
+        const isRecent   = Date.now() - e.createdTimestamp < 5000; // within 5 seconds
+        const isChannel  = (e.extra as any)?.channel?.id === message.channelId;
+        const isTarget   = e.target?.id === message.author?.id;
+        return isRecent && isChannel && isTarget;
+      });
+
+      if (entry) {
+        // If the deleter is the same as the message author, they deleted their own
+        deletedBySelf = entry.executor?.id === message.author?.id;
+        deletedBy     = entry.executor?.id ?? null;
+      } else {
+        // No audit log entry = author deleted their own message
+        deletedBySelf = true;
+        deletedBy     = message.author?.id ?? null;
+      }
+    } catch {
+      // Missing audit log permission — just skip the who-deleted info
+    }
+
     const cached = messageCache.get(message.id);
 
+    let updatedEmbed: EmbedBuilder;
+
     if (cached) {
-      const updatedEmbed = await buildDeletedEmbed(
-        message.id,
-        cached,
-        message.guild,
-        logChannel as TextChannel,
-      );
-      await logEntry.edit({ embeds: [updatedEmbed] });
+      updatedEmbed = await buildDeletedEmbed(message.id, cached, message.guild, logChannel as TextChannel);
     } else {
-      // Fallback: sent before bot started, no cache available
-      const embed = new EmbedBuilder()
+      updatedEmbed = new EmbedBuilder()
         .setColor(Colors.Red)
         .setTitle('🗑 Message Deleted')
         .setTimestamp()
@@ -516,10 +595,29 @@ export async function logDeletedMessage(
           { name: 'Channel', value: `<#${message.channelId}>`, inline: true },
           { name: 'Content', value: '*Content unavailable — message was sent before bot started*' },
         );
-      await logEntry.edit({ embeds: [embed] });
     }
 
-    // Clean up memory and DB
+    // Add the deleted-by field
+    if (deletedBy) {
+      if (deletedBySelf) {
+        updatedEmbed.addFields({
+          name: '🗑 Deleted By',
+          value: `<@${deletedBy}> *(deleted their own message)*`,
+        });
+      } else {
+        updatedEmbed.addFields({
+          name: '🛡 Deleted By Moderator',
+          value: `<@${deletedBy}>`,
+        });
+        // Make it more obvious it was a mod deletion
+        updatedEmbed.setColor(Colors.DarkRed);
+        updatedEmbed.setTitle('🛡 Message Deleted by Moderator');
+      }
+    }
+
+    await logEntry.edit({ embeds: [updatedEmbed] });
+
+    // Clean up
     logMessageMap.delete(message.id);
     messageCache.delete(message.id);
     deleteLogMessageMap(message.id);
@@ -569,7 +667,6 @@ export async function logBulkDelete(
 
     await (logChannel as TextChannel).send({ embeds: [embed] });
 
-    // Clean up
     for (const id of messages.keys()) {
       logMessageMap.delete(id);
       messageCache.delete(id);
@@ -591,7 +688,6 @@ export async function logEditedMessage(
   if (!newMessage.guild) return;
   if (newMessage.author?.bot) return;
 
-  // Only log if content actually changed
   const oldContent = oldMessage.partial ? null : oldMessage.content;
   const newContent = newMessage.partial ? null : newMessage.content;
   if (oldContent === newContent) return;
@@ -599,7 +695,6 @@ export async function logEditedMessage(
   const config = modLogConfigs.get(newMessage.guild.id);
   if (!config) return;
 
-  // Skip ignored channels
   if (ignoredChannels.get(newMessage.guild.id)?.has(newMessage.channelId)) return;
 
   try {
@@ -628,22 +723,19 @@ export async function logEditedMessage(
       );
     }
 
-    // Before — pull from our cache if available, otherwise show what we have
-    const cached = messageCache.get(newMessage.id);
+    const cached     = messageCache.get(newMessage.id);
     const beforeText = cached?.content ?? oldContent ?? '*Not available*';
     embed.addFields({
       name: 'Before',
       value: beforeText.length > 1024 ? beforeText.slice(0, 1021) + '...' : beforeText || '*Empty*',
     });
 
-    // After
     const afterText = newContent ?? full?.content ?? '*Not available*';
     embed.addFields({
       name: 'After',
       value: afterText.length > 1024 ? afterText.slice(0, 1021) + '...' : afterText || '*Empty*',
     });
 
-    // Jump link
     embed.addFields({
       name: 'Jump to message',
       value: `[Click here](https://discord.com/channels/${newMessage.guild.id}/${newMessage.channelId}/${newMessage.id})`,
@@ -651,7 +743,6 @@ export async function logEditedMessage(
 
     await (logChannel as TextChannel).send({ embeds: [embed] });
 
-    // Update cache with new content
     if (cached && newContent) {
       cached.content = newContent;
       messageCache.set(newMessage.id, cached);
@@ -688,9 +779,9 @@ export async function logMemberJoin(member: GuildMember): Promise<void> {
       .setTimestamp()
       .setFooter({ text: `User ID: ${member.id}` })
       .addFields(
-        { name: 'User',           value: `<@${member.id}>`, inline: true },
+        { name: 'User',            value: `<@${member.id}>`, inline: true },
         { name: 'Account Created', value: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`, inline: true },
-        { name: 'Account Age',    value: `${accountDays} day${accountDays !== 1 ? 's' : ''}`, inline: true },
+        { name: 'Account Age',     value: `${accountDays} day${accountDays !== 1 ? 's' : ''}`, inline: true },
       );
 
     if (isNew) {
@@ -718,7 +809,7 @@ export async function logMemberLeave(member: GuildMember | PartialGuildMember): 
     if (!logChannel || !logChannel.isTextBased()) return;
 
     const roles = member.roles.cache
-      .filter((r) => r.id !== member.guild.id) // exclude @everyone
+      .filter((r) => r.id !== member.guild.id)
       .map((r) => `<@&${r.id}>`)
       .join(', ') || '*None*';
 
@@ -757,7 +848,6 @@ export async function logRoleUpdate(
   const config = modLogConfigs.get(newMember.guild.id);
   if (!config) return;
 
-  // Find roles added/removed
   const oldRoles = oldMember.roles.cache;
   const newRoles = newMember.roles.cache;
 
@@ -801,5 +891,82 @@ export async function logRoleUpdate(
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[modlog] Failed to log role update: ${msg}`);
+  }
+}
+
+// ── Log command usage ─────────────────────────────────────────
+
+export async function logCommandUsage(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  if (!interaction.guild) return;
+
+  // Use dedicated command log channel if set, otherwise fall back to main mod-log
+  const channelId = cmdLogConfigs.get(interaction.guild.id)
+    ?? modLogConfigs.get(interaction.guild.id)?.channelId;
+  if (!channelId) return;
+
+  if (interaction.channelId && ignoredChannels.get(interaction.guild.id)?.has(interaction.channelId)) return;
+
+  try {
+    const logChannel = await interaction.guild.channels.fetch(channelId);
+    if (!logChannel || !logChannel.isTextBased()) return;
+
+    const options = interaction.options.data.map((opt) => {
+      const value = opt.value ?? (opt.channel ? `#${opt.channel.name}` : opt.role ? `@${opt.role.name}` : opt.user?.tag);
+      return `\`${opt.name}\`: ${value}`;
+    }).join('\n') || '*No options*';
+
+    const embed = new EmbedBuilder()
+      .setColor(Colors.Purple)
+      .setTitle('⚙️ Command Used')
+      .setAuthor({
+        name: interaction.user.id,
+        iconURL: interaction.user.displayAvatarURL(),
+      })
+      .setTimestamp()
+      .setFooter({ text: `Interaction ID: ${interaction.id}` })
+      .addFields(
+        { name: 'User',    value: `<@${interaction.user.id}>`, inline: true },
+        { name: 'Channel', value: interaction.channelId ? `<#${interaction.channelId}>` : '*Unknown*', inline: true },
+        { name: 'Command', value: `\`/${interaction.commandName}${interaction.options.getSubcommand(false) ? ' ' + interaction.options.getSubcommand() : ''}\``, inline: true },
+        { name: 'Options', value: options },
+      );
+
+    await (logChannel as TextChannel).send({ embeds: [embed] });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[modlog] Failed to log command usage: ${msg}`);
+  }
+}
+
+export async function checkAuditLogPermission(client: import('discord.js').Client): Promise<void> {
+  for (const [guildId, config] of modLogConfigs) {
+    const guild = await client.guilds.fetch(guildId).catch(() => null);
+    if (!guild) continue;
+
+    const botMember = await guild.members.fetchMe().catch(() => null);
+    if (!botMember) continue;
+
+    const hasPermission = botMember.permissions.has(PermissionFlagsBits.ViewAuditLog);
+
+    const logChannel = await guild.channels.fetch(config.channelId).catch(() => null);
+    if (!logChannel || !logChannel.isTextBased()) continue;
+
+    if (!hasPermission) {
+      await (logChannel as TextChannel).send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(Colors.Red)
+            .setTitle('⚠️ Missing Permission: View Audit Log')
+            .setDescription(
+              'The bot is missing the **View Audit Log** permission.\n\n' +
+              'Without it, deleted messages **cannot show who deleted them**.\n\n' +
+              'To fix this: Server Settings → Roles → find the bot\'s role → enable **View Audit Log**.',
+            )
+            .setTimestamp(),
+        ],
+      });
+    }
   }
 }

@@ -36,6 +36,8 @@ import {
   logMemberLeave,
   logRoleUpdate,
   loadModLogConfigs,
+  logCommandUsage,
+  checkAuditLogPermission,
 } from './features/modlog';
 import { handleQuoteMention } from './features/quote';
 import {
@@ -84,6 +86,7 @@ client.once('ready', async () => {
   loadAdminRoles();                       // ← load role config first
   await loadAutoDeleteRules();
   loadModLogConfigs();
+  await checkAuditLogPermission(client);
   startSweepLoop(client);
 });
 
@@ -105,6 +108,8 @@ client.on('messageDeleteBulk', (messages, channel) => {
 // ── Interactions ──────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
+
+  await logCommandUsage(interaction);
 
   const cmd = interaction.commandName;
 
@@ -166,5 +171,7 @@ client.on('guildMemberUpdate', (oldMember, newMember) => {
   handleBoostChange(oldMember as any, newMember as any, client);
   logRoleUpdate(oldMember as any, newMember as any);
 });
+
+
 
 client.login(process.env.BOT_TOKEN);

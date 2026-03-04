@@ -69,6 +69,10 @@ function initDatabase() {
       delay_ms   INTEGER NOT NULL,
       label      TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS modlog_cmdlog_config (
+      guild_id   TEXT PRIMARY KEY,
+      channel_id TEXT NOT NULL
+    );
   `);
 }
 initDatabase();
@@ -355,4 +359,23 @@ export function saveBoosterCard(guildId: string, userId: string, messageId: stri
 
 export function deleteBoosterCard(guildId: string, userId: string): void {
   db.prepare("DELETE FROM booster_cards WHERE guild_id = ? AND user_id = ?").run(guildId, userId);
+}
+
+// ─── Mod-log Command Log Channel ─────────────────────────────
+
+export function getCmdLogConfig(): { guildId: string; channelId: string }[] {
+  return (db.prepare("SELECT guild_id, channel_id FROM modlog_cmdlog_config").all() as any[])
+    .map((row) => ({ guildId: row.guild_id, channelId: row.channel_id }));
+}
+
+export function saveCmdLogConfig(guildId: string, channelId: string): void {
+  db.prepare(`
+    INSERT INTO modlog_cmdlog_config (guild_id, channel_id)
+    VALUES (?, ?)
+    ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id
+  `).run(guildId, channelId);
+}
+
+export function deleteCmdLogConfig(guildId: string): void {
+  db.prepare("DELETE FROM modlog_cmdlog_config WHERE guild_id = ?").run(guildId);
 }
