@@ -15,7 +15,7 @@ And if you can, have it expire when they stop boosting
 
 Confession 
 Star board 
-Quote 
+Quote - need to work on emojis actually showing up - only reply with a quote if it is @d in reply 
 Swaffy  f 
 
 logging edited messages and joins/ updates

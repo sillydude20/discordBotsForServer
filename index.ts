@@ -76,14 +76,14 @@ client.once('ready', async () => {
         modLogCommand.toJSON(),
         boosterCommand.toJSON(),
         boosterAdminCommand.toJSON(),
-        setupRoleCommand.toJSON(),        // ← /setuprole registered
+        setupRoleCommand.toJSON(),
       ],
     },
   );
   console.log('✅ Slash commands registered');
 
   setupStarboard(client);
-  loadAdminRoles();                       // ← load role config first
+  loadAdminRoles();
   await loadAutoDeleteRules();
   loadModLogConfigs();
   await checkAuditLogPermission(client);
@@ -107,8 +107,19 @@ client.on('messageDeleteBulk', (messages, channel) => {
 
 // ── Interactions ──────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
+  // ── User ID button handler ──────────────────────────────────
+  if (interaction.isButton() && interaction.customId.startsWith('copy_uid_')) {
+    const userId = interaction.customId.replace('copy_uid_', '');
+    await interaction.reply({
+      content: `\`${userId}\``,
+      ephemeral: true,
+    });
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
+  // Log every slash command before dispatching
   await logCommandUsage(interaction);
 
   const cmd = interaction.commandName;
@@ -152,12 +163,12 @@ client.on('interactionCreate', async (interaction) => {
   await command.execute(interaction as ChatInputCommandInteraction);
 });
 
-// Log edited messages
+// ── Log edited messages ───────────────────────────────────────
 client.on('messageUpdate', (oldMessage, newMessage) => {
   logEditedMessage(oldMessage, newMessage);
 });
 
-// Log member join / leave
+// ── Log member join / leave ───────────────────────────────────
 client.on('guildMemberAdd', (member) => {
   logMemberJoin(member as any);
 });
@@ -166,12 +177,10 @@ client.on('guildMemberRemove', (member) => {
   logMemberLeave(member as any);
 });
 
-// ── Boost detection ───────────────────────────────────────────
+// ── Boost detection & role updates ───────────────────────────
 client.on('guildMemberUpdate', (oldMember, newMember) => {
   handleBoostChange(oldMember as any, newMember as any, client);
   logRoleUpdate(oldMember as any, newMember as any);
 });
-
-
 
 client.login(process.env.BOT_TOKEN);

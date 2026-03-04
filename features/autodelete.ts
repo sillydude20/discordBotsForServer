@@ -20,6 +20,9 @@ import {
   getAutoDeleteRules,
   saveAutoDeleteRule,
   deleteAutoDeleteRule,
+  getAutoDeleteIgnoredMessages,
+  saveAutoDeleteIgnoredMessage,
+  deleteAutoDeleteIgnoredMessage,
 } from '../utils/database';
 
 // ── Types ─────────────────────────────────────────────────────
@@ -39,8 +42,9 @@ const MULTIPLIERS: Record<DurationUnit, number> = {
   d: 86_400_000,
 };
 
-// ── In-memory cache (loaded from DB on startup) ───────────────
-const autoDeleteRules = new Map<string, AutoDeleteRule>();
+// ── In-memory cache ───────────────────────────────────────────
+const autoDeleteRules = new Map<string, AutoDeleteRule>(); // channelId → rule
+const ignoredMessages = new Set<string>();                 // messageId
 
 export async function loadAutoDeleteRules(): Promise<void> {
   const rows = await getAutoDeleteRules();
@@ -52,7 +56,17 @@ export async function loadAutoDeleteRules(): Promise<void> {
       label: row.label,
     });
   }
-  console.log(`📦 Loaded ${autoDeleteRules.size} auto-delete rule(s) from database`);
+
+  const ignoredRows = await getAutoDeleteIgnoredMessages();
+  ignoredMessages.clear();
+  for (const row of ignoredRows) {
+    ignoredMessages.add(row.messageId);
+  }
+
+  console.log(
+    `📦 Loaded ${autoDeleteRules.size} auto-delete rule(s) and ` +
+    `${ignoredMessages.size} ignored message(s) from database`,
+  );
 }
 
 // ── Duration helpers ──────────────────────────────────────────
@@ -110,6 +124,25 @@ export const autoDeleteCommand = new SlashCommandBuilder()
       .addChannelOption((opt) =>
         opt.setName('channel').setDescription('Target channel').setRequired(true),
       ),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('ignore')
+      .setDescription('Prevent a specific message from being auto-deleted')
+      .addStringOption((opt) =>
+        opt.setName('messageid').setDescription('The ID of the message to ignore').setRequired(true),
+      ),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('unignore')
+      .setDescription('Remove the auto-delete ignore from a specific message')
+      .addStringOption((opt) =>
+        opt.setName('messageid').setDescription('The ID of the message to unignore').setRequired(true),
+      ),
+  )
+  .addSubcommand((sub) =>
+    sub.setName('ignorelist').setDescription('List all messages currently ignored from auto-delete'),
   );
 
 // ── Command registration ──────────────────────────────────────
@@ -138,8 +171,8 @@ async function bulkDeleteChannel(channel: TextChannel): Promise<number> {
     const fetched: Collection<Snowflake, Message> = await channel.messages.fetch({ limit: 100 });
     if (!fetched.size) break;
 
-    const recent = fetched.filter((m) => Date.now() - m.createdTimestamp < TWO_WEEKS);
-    const old    = fetched.filter((m) => Date.now() - m.createdTimestamp >= TWO_WEEKS);
+    const recent = fetched.filter((m) => Date.now() - m.createdTimestamp < TWO_WEEKS && !ignoredMessages.has(m.id));
+    const old    = fetched.filter((m) => Date.now() - m.createdTimestamp >= TWO_WEEKS && !ignoredMessages.has(m.id));
 
     if (recent.size > 1) {
       const result = await channel.bulkDelete(recent, true);
@@ -171,7 +204,7 @@ async function sweepChannel(channel: TextChannel, delayMs: number): Promise<numb
     const fetched: Collection<Snowflake, Message> = await channel.messages.fetch(options);
     if (!fetched.size) break;
 
-    const toDelete = fetched.filter((m) => m.createdTimestamp < cutoff);
+    const toDelete = fetched.filter((m) => m.createdTimestamp < cutoff && !ignoredMessages.has(m.id));
     const recent   = toDelete.filter((m) => Date.now() - m.createdTimestamp < TWO_WEEKS);
     const old      = toDelete.filter((m) => Date.now() - m.createdTimestamp >= TWO_WEEKS);
 
@@ -228,8 +261,13 @@ export function handleMessage(message: Message): void {
   const rule = autoDeleteRules.get(message.channelId);
   if (!rule) return;
 
+  // Don't schedule deletion if this message is ignored
+  if (ignoredMessages.has(message.id)) return;
+
   setTimeout(async () => {
     try {
+      // Re-check ignore in case it was added after the message was sent
+      if (ignoredMessages.has(message.id)) return;
       const msg = await message.channel.messages.fetch(message.id).catch(() => null);
       if (msg) await msg.delete();
     } catch { /* already deleted */ }
@@ -331,6 +369,59 @@ export async function handleAutoDeleteInteraction(
       const msg = err instanceof Error ? err.message : String(err);
       await interaction.editReply({ content: `❌ Failed to purge: ${msg}` });
     }
+    return;
+  }
+
+  // /autodelete ignore
+  if (sub === 'ignore') {
+    const messageId = interaction.options.getString('messageid', true).trim();
+
+    if (ignoredMessages.has(messageId)) {
+      await interaction.reply({ content: `ℹ️ Message \`${messageId}\` is already ignored.`, ephemeral: true });
+      return;
+    }
+
+    ignoredMessages.add(messageId);
+    await saveAutoDeleteIgnoredMessage(messageId, interaction.guildId ?? '');
+
+    await interaction.reply({
+      content: `✅ Message \`${messageId}\` will no longer be auto-deleted.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // /autodelete unignore
+  if (sub === 'unignore') {
+    const messageId = interaction.options.getString('messageid', true).trim();
+
+    if (!ignoredMessages.has(messageId)) {
+      await interaction.reply({ content: `ℹ️ Message \`${messageId}\` is not currently ignored.`, ephemeral: true });
+      return;
+    }
+
+    ignoredMessages.delete(messageId);
+    await deleteAutoDeleteIgnoredMessage(messageId);
+
+    await interaction.reply({
+      content: `✅ Message \`${messageId}\` will now be auto-deleted again.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // /autodelete ignorelist
+  if (sub === 'ignorelist') {
+    if (ignoredMessages.size === 0) {
+      await interaction.reply({ content: 'ℹ️ No messages are currently ignored from auto-delete.', ephemeral: true });
+      return;
+    }
+
+    const list = [...ignoredMessages].map((id) => `• \`${id}\``).join('\n');
+    await interaction.reply({
+      content: `**Ignored messages (${ignoredMessages.size}):**\n${list}`,
+      ephemeral: true,
+    });
   }
 }
 
