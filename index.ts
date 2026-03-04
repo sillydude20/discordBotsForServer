@@ -10,6 +10,7 @@ import {
   TextChannel,
 } from 'discord.js';
 import * as starboardCommand from './commands/starboard';
+import * as confessionCommand from './commands/confession';
 import setupStarboard from './features/starboard';
 import {
   startSweepLoop,
@@ -61,6 +62,7 @@ const client = new Client({
 // ── Command collection ────────────────────────────────────────
 const commands = new Collection<string, any>();
 commands.set(starboardCommand.data.name, starboardCommand);
+commands.set(confessionCommand.data.name, confessionCommand);
 
 // ── Ready ─────────────────────────────────────────────────────
 client.once('ready', async () => {
@@ -72,6 +74,7 @@ client.once('ready', async () => {
     {
       body: [
         starboardCommand.data.toJSON(),
+        confessionCommand.data.toJSON(),
         autoDeleteCommand.toJSON(),
         modLogCommand.toJSON(),
         boosterCommand.toJSON(),
@@ -110,10 +113,7 @@ client.on('interactionCreate', async (interaction) => {
   // ── User ID button handler ──────────────────────────────────
   if (interaction.isButton() && interaction.customId.startsWith('copy_uid_')) {
     const userId = interaction.customId.replace('copy_uid_', '');
-    await interaction.reply({
-      content: `\`${userId}\``,
-      ephemeral: true,
-    });
+    await interaction.reply({ content: `\`${userId}\``, ephemeral: true });
     return;
   }
 
@@ -124,13 +124,19 @@ client.on('interactionCreate', async (interaction) => {
 
   const cmd = interaction.commandName;
 
-  // /setuprole — only needs ManageGuild (handled inside the command itself)
+  // /confession — open to everyone, no admin role required
+  if (cmd === 'confession') {
+    await confessionCommand.execute(interaction);
+    return;
+  }
+
+  // /setuprole — only needs ManageGuild
   if (cmd === 'setuprole') {
     await handleSetupRoleInteraction(interaction);
     return;
   }
 
-  // /booster — open to all, but internally checks if user is a booster
+  // /booster — open to all, internally checks if user is a booster
   if (cmd === 'booster') {
     await handleBoosterInteraction(interaction, client);
     return;

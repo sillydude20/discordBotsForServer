@@ -73,6 +73,10 @@ function initDatabase() {
       guild_id   TEXT PRIMARY KEY,
       channel_id TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS autodelete_ignored_messages (
+      message_id TEXT PRIMARY KEY,
+      guild_id   TEXT NOT NULL
+    );
   `);
 }
 initDatabase();
@@ -378,4 +382,20 @@ export function saveCmdLogConfig(guildId: string, channelId: string): void {
 
 export function deleteCmdLogConfig(guildId: string): void {
   db.prepare("DELETE FROM modlog_cmdlog_config WHERE guild_id = ?").run(guildId);
+}
+
+// ─── Auto-delete Ignored Messages ────────────────────────────
+
+export function getAutoDeleteIgnoredMessages(): { messageId: string; guildId: string }[] {
+  return (db.prepare("SELECT message_id, guild_id FROM autodelete_ignored_messages").all() as any[])
+    .map((row) => ({ messageId: row.message_id, guildId: row.guild_id }));
+}
+
+export function saveAutoDeleteIgnoredMessage(messageId: string, guildId: string): void {
+  db.prepare("INSERT OR IGNORE INTO autodelete_ignored_messages (message_id, guild_id) VALUES (?, ?)")
+    .run(messageId, guildId);
+}
+
+export function deleteAutoDeleteIgnoredMessage(messageId: string): void {
+  db.prepare("DELETE FROM autodelete_ignored_messages WHERE message_id = ?").run(messageId);
 }
