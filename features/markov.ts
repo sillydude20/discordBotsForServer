@@ -8,6 +8,11 @@
 //   /markov import            — import existing mod-log cache (enabled channels only)
 //   /markov wipe              — delete all stored messages for this server
 //   /markov status            — show current config and message count
+//
+// NOTE: Reply-to-bot detection is handled in index.ts.
+//       This module only handles: saving messages from enabled channels
+//       and auto-interval generation. It also exports generateMarkov()
+//       so index.ts can call it directly.
 // ─────────────────────────────────────────────────────────────
 
 import {
@@ -48,7 +53,7 @@ db.exec(`
 // ── In-memory ─────────────────────────────────────────────────
 const enabledChannels = new Set<string>(); // channelId
 const autoIntervals   = new Map<string, number>(); // guildId → every N messages
-const messageCounts   = new Map<string, number>(); // guildId → current count since last gen
+const messageCounts   = new Map<string, number>(); // guildId → count since last gen
 
 // ── Load from DB on startup ───────────────────────────────────
 export function loadMarkovConfig(): void {
@@ -92,7 +97,12 @@ function getEnabledChannelsForGuild(guildId: string): string[] {
 }
 
 // ── Generate text ─────────────────────────────────────────────
-function generateText(guildId: string): string | null {
+
+/**
+ * Generate a markov string for the given guild.
+ * Returns null if there isn't enough data yet.
+ */
+export function generateMarkov(guildId: string): string | null {
   const messages = getMessages(guildId);
   if (messages.length < 10) return null;
 
@@ -109,57 +119,22 @@ function generateText(guildId: string): string | null {
   }
 }
 
-// ── Track bot markov message IDs ──────────────────────────────
-export const markovMsgIds = new Set<string>();
-
 // ── Handle incoming messages ──────────────────────────────────
+// Only saves content from enabled channels and handles auto-interval.
+// Does NOT handle bot replies — that's index.ts's job.
+
 export async function handleMarkovMessage(message: Message, client: Client): Promise<void> {
   if (message.author.bot) return;
   if (!message.guild) return;
+  if (!message.content || message.content.length < 5) return;
   if (message.content.startsWith('/')) return;
 
-  // ── Reply-to-bot logic (checked BEFORE length gate) ──────────
-  if (message.reference?.messageId) {
-    try {
-      const repliedTo = await message.channel.messages.fetch(message.reference.messageId);
-      if (repliedTo.author.id === client.user!.id) {
-        // Treat as a markov message if:
-        // 1. It's tracked in markovMsgIds (current session), OR
-        // 2. It's plain text with no embeds/components (survives bot restarts)
-        const isMarkovMsg =
-          markovMsgIds.has(repliedTo.id) ||
-          (repliedTo.embeds.length === 0 &&
-           repliedTo.components.length === 0 &&
-           repliedTo.content.length > 0);
-
-        // Only save the reply if it's long enough to be useful training data
-        if (enabledChannels.has(message.channelId) && message.content.length >= 5) {
-          saveMessage(message.guild.id, message.channelId, message.content);
-        }
-
-        // Reply with generated text unless the user also @mentioned the bot
-        // (in that case the quote handler takes over)
-        if (isMarkovMsg && !message.mentions.has(client.user!.id)) {
-          const generated = generateText(message.guild.id);
-          if (generated) {
-            const sent = await message.reply(generated);
-            markovMsgIds.add(sent.id);
-          }
-        }
-
-        return;
-      }
-    } catch { /* fetch failed, fall through */ }
-  }
-
-  // ── Length gate (only applies to saving + auto-interval) ─────
-  if (!message.content || message.content.length < 5) return;
-
-  // ── Normal flow — only enabled channels ──────────────────────
+  // Only process enabled channels
   if (!enabledChannels.has(message.channelId)) return;
 
   saveMessage(message.guild.id, message.channelId, message.content);
 
+  // Auto-interval generation
   const interval = autoIntervals.get(message.guild.id);
   if (interval && interval > 0) {
     const count = (messageCounts.get(message.guild.id) ?? 0) + 1;
@@ -167,16 +142,16 @@ export async function handleMarkovMessage(message: Message, client: Client): Pro
 
     if (count >= interval) {
       messageCounts.set(message.guild.id, 0);
-      const generated = generateText(message.guild.id);
+      const generated = generateMarkov(message.guild.id);
       if (generated) {
-        const sent = await (message.channel as TextChannel).send(generated);
-        markovMsgIds.add(sent.id);
+        await (message.channel as TextChannel).send(generated);
       }
     }
   }
 }
 
 // ── Slash command ─────────────────────────────────────────────
+
 export const markovCommand = new SlashCommandBuilder()
   .setName('markov')
   .setDescription('AI message generation based on server messages')
@@ -224,7 +199,10 @@ export const markovCommand = new SlashCommandBuilder()
   );
 
 // ── Interaction handler ───────────────────────────────────────
-export async function handleMarkovInteraction(interaction: ChatInputCommandInteraction,): Promise<void> {
+
+export async function handleMarkovInteraction(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
   if (interaction.commandName !== 'markov') return;
   if (!interaction.guild) return;
 
@@ -237,7 +215,7 @@ export async function handleMarkovInteraction(interaction: ChatInputCommandInter
       .run(interaction.guild.id, channel.id);
     enabledChannels.add(channel.id);
     await interaction.reply({
-      content: `✅ Now learning from messages in <#${channel.id}>. The more messages sent, the better the generations.\n\nTip: use \`/markov import\` to pull in messages already stored by the mod-log.`,
+      content: `✅ Now learning from messages in <#${channel.id}>.\n\nTip: use \`/markov import\` to pull in messages already stored by the mod-log.`,
       ephemeral: true,
     });
     return;
@@ -250,7 +228,7 @@ export async function handleMarkovInteraction(interaction: ChatInputCommandInter
       .run(interaction.guild.id, channel.id);
     enabledChannels.delete(channel.id);
     await interaction.reply({
-      content: `✅ No longer learning from <#${channel.id}>. Existing stored messages from that channel are kept — use \`/markov wipe\` to clear everything.`,
+      content: `✅ No longer learning from <#${channel.id}>. Existing stored messages are kept — use \`/markov wipe\` to clear everything.`,
       ephemeral: true,
     });
     return;
@@ -259,7 +237,7 @@ export async function handleMarkovInteraction(interaction: ChatInputCommandInter
   // /markov generate
   if (sub === 'generate') {
     await interaction.deferReply();
-    const generated = generateText(interaction.guild.id);
+    const generated = generateMarkov(interaction.guild.id);
     if (!generated) {
       await interaction.editReply('❌ Not enough messages collected yet. Enable some channels and wait for more messages, or use `/markov import`.');
       return;
@@ -271,7 +249,6 @@ export async function handleMarkovInteraction(interaction: ChatInputCommandInter
   // /markov autoset
   if (sub === 'autoset') {
     const interval = interaction.options.getInteger('interval', true);
-
     db.prepare(`
       INSERT INTO markov_config (guild_id, auto_interval) VALUES (?, ?)
       ON CONFLICT(guild_id) DO UPDATE SET auto_interval = excluded.auto_interval
@@ -296,9 +273,8 @@ export async function handleMarkovInteraction(interaction: ChatInputCommandInter
     await interaction.deferReply({ ephemeral: true });
 
     const enabledForGuild = getEnabledChannelsForGuild(interaction.guild.id);
-
     if (enabledForGuild.length === 0) {
-      await interaction.editReply('❌ No channels are enabled for markov learning. Use `/markov enable` first, then import.');
+      await interaction.editReply('❌ No channels are enabled for markov learning. Use `/markov enable` first.');
       return;
     }
 
@@ -321,38 +297,22 @@ export async function handleMarkovInteraction(interaction: ChatInputCommandInter
       return;
     }
 
-    let imported = 0;
-    let skipped  = 0;
-
-    const insert = db.prepare(
-      'INSERT INTO markov_messages (guild_id, channel_id, content) VALUES (?, ?, ?)',
-    );
-
+    let imported = 0, skipped = 0;
+    const insert = db.prepare('INSERT INTO markov_messages (guild_id, channel_id, content) VALUES (?, ?, ?)');
     const importMany = db.transaction((rows: any[]) => {
       for (const row of rows) {
-        if (existing.has(row.content)) {
-          skipped++;
-          continue;
-        }
-        if (row.content.startsWith('/')) {
-          skipped++;
-          continue;
-        }
+        if (existing.has(row.content) || row.content.startsWith('/')) { skipped++; continue; }
         insert.run(interaction.guild!.id, row.channel_id, row.content);
         existing.add(row.content);
         imported++;
       }
     });
-
     importMany(rows);
 
     const total = getMessageCount(interaction.guild.id);
-
     await interaction.editReply(
-      `✅ Import complete.\n` +
-      `**${imported}** messages imported from **${enabledForGuild.length}** enabled channel(s).\n` +
-      `**${skipped}** skipped (already stored or filtered).\n` +
-      `**${total}** total messages now available for generation.`,
+      `✅ Import complete.\n**${imported}** messages imported from **${enabledForGuild.length}** enabled channel(s).\n` +
+      `**${skipped}** skipped (already stored or filtered).\n**${total}** total messages now available.`,
     );
     return;
   }
@@ -371,13 +331,10 @@ export async function handleMarkovInteraction(interaction: ChatInputCommandInter
     const channels = getEnabledChannelsForGuild(interaction.guild.id)
       .map(id => `<#${id}>`).join(', ') || '*None*';
 
-    const quality = count < 10
-      ? '❌ Too few messages — generation will fail'
-      : count < 50
-      ? '⚠️ Low — results may be poor'
-      : count < 200
-      ? '🟡 Decent — getting there'
-      : '✅ Good';
+    const quality = count < 10   ? '❌ Too few messages — generation will fail'
+                  : count < 50   ? '⚠️ Low — results may be poor'
+                  : count < 200  ? '🟡 Decent — getting there'
+                  : '✅ Good';
 
     const embed = new EmbedBuilder()
       .setColor(Colors.Blurple)
@@ -391,6 +348,5 @@ export async function handleMarkovInteraction(interaction: ChatInputCommandInter
       .setFooter({ text: 'Use /markov import to pull in existing mod-log data' });
 
     await interaction.reply({ embeds: [embed], ephemeral: true });
-    return;
   }
 }
