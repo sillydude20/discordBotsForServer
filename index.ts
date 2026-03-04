@@ -47,6 +47,12 @@ import {
   checkAdminRole,
   loadAdminRoles,
 } from './utils/rolecheck';
+import {
+  markovCommand,
+  handleMarkovInteraction,
+  handleMarkovMessage,
+  loadMarkovConfig,
+} from './features/markov';
 
 const client = new Client({
   intents: [
@@ -80,6 +86,7 @@ client.once('ready', async () => {
         boosterCommand.toJSON(),
         boosterAdminCommand.toJSON(),
         setupRoleCommand.toJSON(),
+        markovCommand.toJSON(),
       ],
     },
   );
@@ -89,6 +96,7 @@ client.once('ready', async () => {
   loadAdminRoles();
   await loadAutoDeleteRules();
   loadModLogConfigs();
+  loadMarkovConfig();
   await checkAuditLogPermission(client);
   startSweepLoop(client);
 });
@@ -97,7 +105,10 @@ client.once('ready', async () => {
 client.on('messageCreate', (message) => {
   handleMessage(message);
   if (!message.partial) logNewMessage(message);
-  if (!message.partial && message.mentions.users.size > 0) handleQuoteMention(message, client);
+  if (!message.partial) handleMarkovMessage(message, client);
+  if (!message.partial && message.content.includes(`<@${client.user!.id}>`)) {
+  handleQuoteMention(message, client);
+}
 });
 
 client.on('messageDelete', (message) => {
@@ -159,6 +170,12 @@ client.on('interactionCreate', async (interaction) => {
   if (cmd === 'boosteradmin') {
     if (!await checkAdminRole(interaction)) return;
     await handleBoosterAdminInteraction(interaction, client);
+    return;
+  }
+
+  if (cmd === 'markov') {
+    if (!await checkAdminRole(interaction)) return;
+    await handleMarkovInteraction(interaction);
     return;
   }
 

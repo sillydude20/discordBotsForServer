@@ -4,7 +4,7 @@ import {
   ButtonInteraction, ComponentType, AttachmentBuilder,
 } from 'discord.js';
 import { createCanvas, loadImage, SKRSContext2D, Image } from '@napi-rs/canvas';
-
+import { markovMsgIds } from './markov';
 interface QuoteState {
   authorId: string; authorName: string; authorAvatar: string;
   authorHandle: string; content: string;
@@ -351,6 +351,8 @@ export async function handleQuoteMention(message: Message, client: Client): Prom
   if (!message.mentions.has(client.user!.id)) return;
   if (!message.reference?.messageId) return;
 
+  if (quoteMsgIds.has(message.reference.messageId)) return;
+
   // Don't re-trigger if someone replies to a quote the bot already made
   if (quoteMsgIds.has(message.reference.messageId)) return;
 
@@ -358,9 +360,39 @@ export async function handleQuoteMention(message: Message, client: Client): Prom
     const repliedTo = await message.channel.messages.fetch(message.reference.messageId);
 
     if (repliedTo.author.bot) {
-      await message.reply({ content: '❌ You can\'t quote a bot message.' });
-      return;
-    }
+      // Replace the repliedTo.author.bot check with this:
+if (repliedTo.author.bot) {
+  // If it's a markov message, quote it directly
+  if (markovMsgIds.has(repliedTo.id) && repliedTo.content?.length >= 2) {
+    const state: QuoteState = {
+      authorId:     client.user!.id,
+      authorName:   message.guild?.members.me?.displayName ?? client.user!.username,
+      authorHandle: client.user!.username,
+      authorAvatar: client.user!.displayAvatarURL({ extension: 'png', size: 4096 }),
+      content:      repliedTo.content,
+      grayscale:    false,
+      vertical:     false,
+      bold:         false,
+      guildId:      message.guild?.id ?? '',
+      channelId:    message.channelId,
+    };
+
+    const buffer = await generateQuoteImage(state);
+    const sent = await message.reply({
+      files: [new AttachmentBuilder(buffer, { name: 'quote.png' })],
+      components: [buildButtons(state)],
+    });
+
+    quoteMsgIds.add(sent.id);
+    quoteStates.set(sent.id, state);
+    setupButtonCollector(sent, state, message);
+    return;
+  }
+
+  // Any other bot message (quote image, command reply etc.) — do nothing
+  return;
+}}
+
 
     if (!repliedTo.content || repliedTo.content.length < 2) {
       await message.reply({ content: '❌ That message has no text.' });
