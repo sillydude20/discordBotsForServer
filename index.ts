@@ -55,7 +55,7 @@ import {
   generateMarkov,
   loadMarkovConfig,
 } from './features/markov';
-
+import { sayCommand, handleSayInteraction } from './commands/say';
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -89,6 +89,7 @@ client.once('ready', async () => {
         boosterAdminCommand.toJSON(),
         setupRoleCommand.toJSON(),
         markovCommand.toJSON(),
+        sayCommand.toJSON(),
       ],
     },
   );
@@ -244,6 +245,11 @@ client.on('interactionCreate', async (interaction) => {
   if (cmd === 'markov') {
     if (!await checkAdminRole(interaction)) return;
     await handleMarkovInteraction(interaction);
+    return;
+  }
+  if (cmd === 'say') {
+    if (!await checkAdminRole(interaction)) return;
+    await handleSayInteraction(interaction);
     return;
   }
 

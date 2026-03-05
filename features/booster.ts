@@ -1,16 +1,18 @@
 // src/features/booster.ts
 // ─────────────────────────────────────────────────────────────
 // Booster perks:
-//   • Personal role with custom color + icon
+//   • Personal role with custom name, color + icon
 //   • Showcase channel card showing profile pic + boost duration
 //     — card is posted when they start boosting
 //     — card is deleted when they stop
 //     — card updates every time they change their color/icon
 //
 // Booster commands:
+//   /booster setup                    — guided multi-step role setup
 //   /booster color <hex>
 //   /booster icon emoji <emoji>
 //   /booster icon url <url>
+//   /booster icon upload <image>
 //   /booster icon clear
 //   /booster reset
 //
@@ -18,6 +20,7 @@
 //   /boosteradmin setup               — set the showcase channel
 //   /boosteradmin clear @user         — remove a user's booster role + card
 //   /boosteradmin list                — list all active boosters
+//   /boosteradmin sync                — audit all boosters, fix missing roles/cards
 // ─────────────────────────────────────────────────────────────
 
 import {
@@ -32,6 +35,18 @@ import {
   Colors,
   TextChannel,
   Snowflake,
+  ButtonBuilder,
+  ButtonStyle,
+  ActionRowBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  ButtonInteraction,
+  ModalSubmitInteraction,
+  ComponentType,
+  InteractionCollector,
+  Message,
+  ReadonlyCollection,
 } from 'discord.js';
 import {
   getBoosterRole,
@@ -50,6 +65,11 @@ import {
 export const boosterCommand = new SlashCommandBuilder()
   .setName('booster')
   .setDescription('Customize your booster role (server boosters only)')
+  .addSubcommand((sub) =>
+    sub
+      .setName('setup')
+      .setDescription('Guided setup to configure your booster role name, color, and icon'),
+  )
   .addSubcommand((sub) =>
     sub
       .setName('color')
@@ -116,6 +136,17 @@ export const boosterAdminCommand = new SlashCommandBuilder()
       ),
   )
   .addSubcommand((sub) =>
+    sub
+      .setName('sync')
+      .setDescription('Audit all boosters — create missing roles/cards, prune stale records')
+      .addBooleanOption((opt) =>
+        opt
+          .setName('prune')
+          .setDescription('Also remove roles/cards for users who stopped boosting (default: true)')
+          .setRequired(false),
+      ),
+  )
+  .addSubcommand((sub) =>
     sub.setName('list').setDescription('List all active booster roles'),
   );
 
@@ -137,22 +168,15 @@ function getBotHighestRolePosition(guild: Guild, botId: string): number {
   return botMember.roles.highest.position;
 }
 
-// Finds the position just above the Server Booster role (or just below the bot's highest role as fallback)
 function getIdealBoosterRolePosition(guild: Guild, botId: string): number {
-  // Look for Discord's built-in Server Booster role (it has the PREMIUM_SUBSCRIBER tag)
   const boosterRole = guild.roles.cache.find(
     (r) => r.tags?.premiumSubscriberRole === true,
   );
-
   if (boosterRole) {
-    // Place perk role one step above the Server Booster role
-    // but never above the bot's own highest role
-    const botPosition = getBotHighestRolePosition(guild, botId);
+    const botPosition    = getBotHighestRolePosition(guild, botId);
     const targetPosition = boosterRole.position + 1;
     return Math.min(targetPosition, botPosition - 1);
   }
-
-  // Fallback: just below the bot's highest role
   return Math.max(1, getBotHighestRolePosition(guild, botId) - 1);
 }
 
@@ -163,9 +187,9 @@ function formatDuration(since: Date): string {
   const months = Math.floor(days / 30);
   const years  = Math.floor(days / 365);
 
-  if (years > 0)   return `${years} year${years  > 1 ? 's' : ''}`;
-  if (months > 0)  return `${months} month${months > 1 ? 's' : ''}`;
-  if (days > 0)    return `${days} day${days > 1 ? 's' : ''}`;
+  if (years > 0)  return `${years} year${years  > 1 ? 's' : ''}`;
+  if (months > 0) return `${months} month${months > 1 ? 's' : ''}`;
+  if (days > 0)   return `${days} day${days > 1 ? 's' : ''}`;
   return 'Just started!';
 }
 
@@ -214,15 +238,14 @@ async function buildBoosterEmbed(member: GuildMember, role?: Role | null): Promi
     })
     .setThumbnail(member.displayAvatarURL({ size: 256 }))
     .addFields(
-      { name: '👤 Member',        value: `<@${member.id}>`, inline: true },
+      { name: '👤 Member',         value: `<@${member.id}>`,                             inline: true },
       { name: '📅 Boosting since', value: `<t:${Math.floor(since.getTime() / 1000)}:D>`, inline: true },
-      { name: '⏱ Duration',        value: duration, inline: true },
+      { name: '⏱ Duration',        value: duration,                                       inline: true },
     )
     .setFooter({ text: 'Thank you for boosting! 💖' })
     .setTimestamp(since);
 }
 
-// Posts or updates the booster's showcase card
 async function upsertBoosterCard(
   member: GuildMember,
   client: Client,
@@ -238,26 +261,19 @@ async function upsertBoosterCard(
   const existingId = getBoosterCard(member.guild.id, member.id);
 
   if (existingId) {
-    // Try to edit the existing card
     const existing = await (channel as TextChannel).messages.fetch(existingId).catch(() => null);
     if (existing) {
       await existing.edit({ embeds: [embed] });
       return;
     }
-    // Message was deleted — fall through to re-post
     deleteBoosterCard(member.guild.id, member.id);
   }
 
-  // Post a new card
   const sent = await (channel as TextChannel).send({ embeds: [embed] });
   saveBoosterCard(member.guild.id, member.id, sent.id);
 }
 
-// Deletes the booster's showcase card
-async function removeBoosterCard(
-  member: GuildMember,
-  guild: Guild,
-): Promise<void> {
+async function removeBoosterCard(member: GuildMember, guild: Guild): Promise<void> {
   const channelId = getBoosterShowcaseChannel(guild.id);
   if (!channelId) return;
 
@@ -271,6 +287,497 @@ async function removeBoosterCard(
   }
 
   deleteBoosterCard(guild.id, member.id);
+}
+
+// ── Guided setup flow ─────────────────────────────────────────
+
+interface SetupState {
+  name:  string | null;
+  color: number | null;
+  icon:  string | null; // emoji string, image URL, or null
+}
+
+// In-memory session store — one entry per user while setup is active
+const setupSessions = new Map<string, SetupState>();
+
+function buildSetupEmbed(
+  member: GuildMember,
+  state: SetupState,
+  step: 'name' | 'color' | 'icon' | 'done',
+): EmbedBuilder {
+  const stepTitles = {
+    name:  '📝 Step 1 of 3 — Role Name',
+    color: '🎨 Step 2 of 3 — Role Color',
+    icon:  '🖼 Step 3 of 3 — Role Icon',
+    done:  '✅ Setup Complete',
+  };
+
+  const nameVal  = state.name  ?? '*Not set yet*';
+  const colorVal = state.color != null
+    ? `#${state.color.toString(16).padStart(6, '0').toUpperCase()}`
+    : '*Not set yet*';
+  const iconVal  = state.icon  ?? '*None*';
+
+  const descriptions: Record<typeof step, string> = {
+    name:  'Click the button below to set your **role name**.\nThis is what will appear in the member list.',
+    color: 'Click the button below to set your **role color** using a hex code (e.g. `#ff00ff`).',
+    icon:  'Choose how you want to set your **role icon**, or skip this step.\n*(Role icons require Boost Level 2)*',
+    done:  'Your booster role has been saved! Run `/booster setup` any time to change it.',
+  };
+
+  return new EmbedBuilder()
+    .setTitle(stepTitles[step])
+    .setColor(state.color ?? Colors.Gold)
+    .setThumbnail(member.displayAvatarURL({ size: 256 }))
+    .setDescription(descriptions[step])
+    .addFields(
+      { name: '📝 Name',  value: nameVal,  inline: true },
+      { name: '🎨 Color', value: colorVal, inline: true },
+      { name: '🖼 Icon',  value: iconVal,  inline: true },
+    );
+}
+
+function makeNameRow(): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId('booster_setup_name')
+      .setLabel('Set Role Name')
+      .setEmoji('📝')
+      .setStyle(ButtonStyle.Primary),
+  );
+}
+
+function makeColorRow(): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId('booster_setup_color')
+      .setLabel('Set Role Color')
+      .setEmoji('🎨')
+      .setStyle(ButtonStyle.Primary),
+  );
+}
+
+function makeIconRow(hasRoleIcons: boolean): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId('booster_setup_icon_emoji')
+      .setLabel('Use Emoji')
+      .setEmoji('😄')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!hasRoleIcons),
+    new ButtonBuilder()
+      .setCustomId('booster_setup_icon_url')
+      .setLabel('Use Image URL')
+      .setEmoji('🔗')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!hasRoleIcons),
+    new ButtonBuilder()
+      .setCustomId('booster_setup_icon_upload')
+      .setLabel('Upload Image')
+      .setEmoji('📁')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!hasRoleIcons),
+    new ButtonBuilder()
+      .setCustomId('booster_setup_icon_skip')
+      .setLabel('Skip')
+      .setStyle(ButtonStyle.Danger),
+  );
+}
+
+async function applyRoleChanges(
+  member: GuildMember,
+  client: Client,
+  state: SetupState,
+): Promise<Role> {
+  const role   = await getOrCreateBoosterRole(member, client);
+  const edits: Parameters<Role['edit']>[0] = {};
+
+  if (state.name  != null) edits.name  = state.name;
+  if (state.color != null) edits.color = state.color;
+
+  if (state.icon != null) {
+    const customEmojiMatch = state.icon.match(/^<a?:\w+:(\d+)>$/);
+    if (customEmojiMatch) {
+      // Custom server emoji — pass its CDN image URL as the role icon
+      edits.icon = `https://cdn.discordapp.com/emojis/${customEmojiMatch[1]}.png`;
+    } else {
+      edits.icon = state.icon;
+    }
+  }
+
+  if (Object.keys(edits).length > 0) {
+    await role.edit({ ...edits, reason: 'Booster guided setup' });
+  }
+
+  return role;
+}
+
+async function finishSetup(
+  interaction: ButtonInteraction | ModalSubmitInteraction,
+  member: GuildMember,
+  client: Client,
+  state: SetupState,
+  collector: InteractionCollector<ButtonInteraction>,
+): Promise<void> {
+  const role = await applyRoleChanges(member, client, state);
+  await upsertBoosterCard(member, client, role);
+  setupSessions.delete(member.id);
+  collector.stop('done');
+
+  // ModalSubmitInteraction has no .update() — defer then edit the original reply
+  if (interaction.isModalSubmit()) {
+    await interaction.deferUpdate();
+    await interaction.editReply({
+      embeds:     [buildSetupEmbed(member, state, 'done')],
+      components: [],
+    });
+  } else {
+    await (interaction as ButtonInteraction).update({
+      embeds:     [buildSetupEmbed(member, state, 'done')],
+      components: [],
+    });
+  }
+}
+
+export async function handleBoosterSetup(
+  interaction: ChatInputCommandInteraction,
+  client: Client,
+): Promise<void> {
+  const member = interaction.member as GuildMember;
+  const guild  = interaction.guild!;
+  const userId = member.id;
+
+  // Pre-fill state from existing role if present
+  const existingRecord = getBoosterRole(guild.id, userId);
+  const existingRole   = existingRecord
+    ? (guild.roles.cache.get(existingRecord.roleId)
+        ?? await guild.roles.fetch(existingRecord.roleId).catch(() => null))
+    : null;
+
+  const state: SetupState = {
+    name:  existingRole?.name  ?? null,
+    color: existingRole?.color ?? null,
+    icon:  null,
+  };
+  setupSessions.set(userId, state);
+
+  const hasRoleIcons = guild.features.includes('ROLE_ICONS');
+
+  await interaction.reply({
+    embeds:     [buildSetupEmbed(member, state, 'name')],
+    components: [makeNameRow()],
+    ephemeral:  true,
+  });
+
+  const collector = interaction.channel!.createMessageComponentCollector({
+    componentType: ComponentType.Button,
+    time: 5 * 60 * 1000, // 5 min timeout
+    filter: (i) => i.user.id === userId && i.customId.startsWith('booster_setup'),
+  });
+
+  collector.on('collect', async (btn: ButtonInteraction) => {
+    const s = setupSessions.get(userId);
+    if (!s) return;
+
+    // ── Step 1: Name ─────────────────────────────────────────
+    if (btn.customId === 'booster_setup_name') {
+      const modal = new ModalBuilder()
+        .setCustomId('booster_modal_name')
+        .setTitle('Set Your Role Name')
+        .addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId('role_name')
+              .setLabel('Role name (max 32 characters)')
+              .setStyle(TextInputStyle.Short)
+              .setMaxLength(32)
+              .setRequired(true)
+              .setValue(s.name ?? `${member.displayName}'s color`),
+          ),
+        );
+
+      await btn.showModal(modal);
+
+      const submitted = await btn.awaitModalSubmit({
+        filter: (m) => m.customId === 'booster_modal_name' && m.user.id === userId,
+        time: 60_000,
+      }).catch(() => null);
+
+      if (!submitted) return;
+
+      s.name = submitted.fields.getTextInputValue('role_name').trim()
+        || `${member.displayName}'s color`;
+      setupSessions.set(userId, s);
+
+      await submitted.deferUpdate();
+      await submitted.editReply({
+        embeds:     [buildSetupEmbed(member, s, 'color')],
+        components: [makeColorRow()],
+      });
+      return;
+    }
+
+    // ── Step 2: Color ────────────────────────────────────────
+    if (btn.customId === 'booster_setup_color') {
+      const modal = new ModalBuilder()
+        .setCustomId('booster_modal_color')
+        .setTitle('Set Your Role Color')
+        .addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId('role_color')
+              .setLabel('Hex color (e.g. #ff00ff)')
+              .setStyle(TextInputStyle.Short)
+              .setMaxLength(7)
+              .setRequired(true)
+              .setValue(
+                s.color != null
+                  ? `#${s.color.toString(16).padStart(6, '0').toUpperCase()}`
+                  : '#',
+              ),
+          ),
+        );
+
+      await btn.showModal(modal);
+
+      const submitted = await btn.awaitModalSubmit({
+        filter: (m) => m.customId === 'booster_modal_color' && m.user.id === userId,
+        time: 60_000,
+      }).catch(() => null);
+
+      if (!submitted) return;
+
+      const parsed = parseHex(submitted.fields.getTextInputValue('role_color'));
+      if (parsed === null) {
+        await submitted.reply({
+          content: '❌ Invalid hex color — please try again with a format like `#ff00ff`.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      s.color = parsed;
+      setupSessions.set(userId, s);
+
+      await submitted.deferUpdate();
+      await submitted.editReply({
+        embeds:     [buildSetupEmbed(member, s, 'icon')],
+        components: [makeIconRow(hasRoleIcons)],
+      });
+      return;
+    }
+
+    // ── Step 3a: Icon — emoji ────────────────────────────────
+    if (btn.customId === 'booster_setup_icon_emoji') {
+      const modal = new ModalBuilder()
+        .setCustomId('booster_modal_icon_emoji')
+        .setTitle('Set Role Icon — Emoji')
+        .addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId('role_emoji')
+              .setLabel('Enter a custom server emoji')
+              .setPlaceholder(':emoji_name: or paste the emoji directly')
+              .setStyle(TextInputStyle.Short)
+              .setRequired(true),
+          ),
+        );
+
+      await btn.showModal(modal);
+
+      const submitted = await btn.awaitModalSubmit({
+        filter: (m) => m.customId === 'booster_modal_icon_emoji' && m.user.id === userId,
+        time: 60_000,
+      }).catch(() => null);
+
+      if (!submitted) return;
+
+      const emojiInput = submitted.fields.getTextInputValue('role_emoji').trim();
+      const fullMatch  = emojiInput.match(/^<(a?):(\w+):(\d+)>$/);
+      let resolvedEmoji: string | null = null;
+
+      if (fullMatch) {
+        resolvedEmoji = emojiInput;
+      } else {
+        const nameMatch = emojiInput.match(/^:?(\w+):?$/);
+        const found = nameMatch
+          ? guild.emojis.cache.find((e) => e.name === nameMatch[1])
+          : null;
+        if (found) resolvedEmoji = found.toString();
+      }
+
+      if (!resolvedEmoji) {
+        await submitted.reply({
+          content: '❌ Could not find that emoji in this server. Please try again.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      s.icon = resolvedEmoji;
+      setupSessions.set(userId, s);
+      await finishSetup(submitted, member, client, s, collector);
+      return;
+    }
+
+    // ── Step 3b: Icon — URL ──────────────────────────────────
+    if (btn.customId === 'booster_setup_icon_url') {
+      const modal = new ModalBuilder()
+        .setCustomId('booster_modal_icon_url')
+        .setTitle('Set Role Icon — Image URL')
+        .addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId('role_url')
+              .setLabel('Direct image URL (png/jpg/gif/webp)')
+              .setPlaceholder('https://...')
+              .setStyle(TextInputStyle.Short)
+              .setRequired(true),
+          ),
+        );
+
+      await btn.showModal(modal);
+
+      const submitted = await btn.awaitModalSubmit({
+        filter: (m) => m.customId === 'booster_modal_icon_url' && m.user.id === userId,
+        time: 60_000,
+      }).catch(() => null);
+
+      if (!submitted) return;
+
+      const url = submitted.fields.getTextInputValue('role_url').trim();
+      if (!/^https?:\/\//i.test(url)) {
+        await submitted.reply({
+          content: '❌ Please provide a URL starting with `https://`.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      try {
+        const res = await fetch(url, { method: 'HEAD' });
+        const ct  = res.headers.get('content-type') ?? '';
+        if (!ct.startsWith('image/')) {
+          await submitted.reply({
+            content: '❌ That URL does not appear to serve an image.',
+            ephemeral: true,
+          });
+          return;
+        }
+      } catch {
+        await submitted.reply({
+          content: '❌ Could not reach that URL. Make sure it is publicly accessible.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      s.icon = url;
+      setupSessions.set(userId, s);
+      await finishSetup(submitted, member, client, s, collector);
+      return;
+    }
+
+    // ── Step 3c: Icon — upload ───────────────────────────────
+    // Modals can't accept file uploads, so we ask the user to send
+    // their image as a follow-up message and collect it.
+    if (btn.customId === 'booster_setup_icon_upload') {
+      await btn.update({
+        embeds: [
+          buildSetupEmbed(member, s, 'icon')
+            .setDescription(
+              '📁 **Send your image as a message in this channel now.**\n' +
+              'It must be a `.png`, `.jpg`, `.gif`, or `.webp` file under **256kb**.\n\n' +
+              '*Waiting up to 60 seconds…*',
+            ),
+        ],
+        components: [],
+      });
+
+      const msgCollector = (interaction.channel as TextChannel).createMessageCollector({
+        filter: (m: Message) => m.author.id === userId && m.attachments.size > 0,
+        max:  1,
+        time: 60_000,
+      });
+
+      msgCollector.on('collect', async (msg: Message) => {
+        const attachment = msg.attachments.first()!;
+        const ct = attachment.contentType ?? '';
+
+        if (!ct.startsWith('image/')) {
+          await msg.reply({ content: '❌ That file is not an image. Run `/booster setup` to try again.' });
+          setupSessions.delete(userId);
+          collector.stop('cancelled');
+          return;
+        }
+
+        if (attachment.size > 256 * 1024) {
+          await msg.reply({
+            content: `❌ Image is too large (${Math.round(attachment.size / 1024)}kb). Must be under 256kb. Run \`/booster setup\` to try again.`,
+          });
+          setupSessions.delete(userId);
+          collector.stop('cancelled');
+          return;
+        }
+
+        // Delete the upload message to keep the channel tidy
+        await msg.delete().catch(() => null);
+
+        s.icon = attachment.url;
+        setupSessions.set(userId, s);
+
+        const role = await applyRoleChanges(member, client, s);
+        await upsertBoosterCard(member, client, role);
+        setupSessions.delete(userId);
+        collector.stop('done');
+
+        await interaction.editReply({
+          embeds:     [buildSetupEmbed(member, s, 'done')],
+          components: [],
+        });
+      });
+
+      msgCollector.on('end', async (collected: ReadonlyCollection<string, Message>) => {
+        if (collected.size === 0) {
+          await interaction.editReply({
+            embeds: [
+              buildSetupEmbed(member, s, 'icon')
+                .setDescription('⏱ Timed out waiting for an image. Run `/booster setup` again to retry.'),
+            ],
+            components: [],
+          }).catch(() => null);
+          setupSessions.delete(userId);
+          collector.stop('cancelled');
+        }
+      });
+
+      return;
+    }
+
+    // ── Step 3d: Icon — skip ─────────────────────────────────
+    if (btn.customId === 'booster_setup_icon_skip') {
+      s.icon = null;
+      setupSessions.set(userId, s);
+      await finishSetup(btn, member, client, s, collector);
+      return;
+    }
+  });
+
+  // Collector timeout
+  collector.on('end', async (_collected, reason) => {
+    if (reason === 'time') {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(Colors.Red)
+            .setTitle('⏱ Setup timed out')
+            .setDescription('Run `/booster setup` again to start over.'),
+        ],
+        components: [],
+      }).catch(() => null);
+      setupSessions.delete(userId);
+    }
+  });
 }
 
 // ── Booster command handler ───────────────────────────────────
@@ -295,6 +802,12 @@ export async function handleBoosterInteraction(
   const group = interaction.options.getSubcommandGroup(false);
   const sub   = interaction.options.getSubcommand();
 
+  // /booster setup — handles its own reply internally, no defer
+  if (sub === 'setup' && !group) {
+    await handleBoosterSetup(interaction, client);
+    return;
+  }
+
   await interaction.deferReply({ ephemeral: true });
 
   try {
@@ -309,7 +822,7 @@ export async function handleBoosterInteraction(
         return;
       }
       await role.setColor(color, 'Booster set custom color');
-      await upsertBoosterCard(member, client, role);
+      await upsertBoosterCard(member, client, role).catch(() => null);
       await interaction.editReply({
         content: `✅ Color set to **#${color.toString(16).padStart(6, '0').toUpperCase()}** and your showcase card has been updated.`,
       });
@@ -319,7 +832,7 @@ export async function handleBoosterInteraction(
     // /booster reset
     if (sub === 'reset') {
       await role.setColor(0x000000, 'Booster reset color');
-      await upsertBoosterCard(member, client, role);
+      await upsertBoosterCard(member, client, role).catch(() => null);
       await interaction.editReply({ content: '✅ Color reset to default and showcase card updated.' });
       return;
     }
@@ -348,10 +861,15 @@ export async function handleBoosterInteraction(
         resolvedEmoji = found.toString();
       }
 
-      await role.setUnicodeEmoji(resolvedEmoji).catch(() =>
-        role.edit({ icon: resolvedEmoji }),
-      );
-      await upsertBoosterCard(member, client, role);
+      // Custom server emoji must be passed as its CDN image URL
+      const emojiIdMatch = resolvedEmoji.match(/^<a?:\w+:(\d+)>$/);
+      if (emojiIdMatch) {
+        await role.edit({ icon: `https://cdn.discordapp.com/emojis/${emojiIdMatch[1]}.png` });
+      } else {
+        // Standard unicode emoji
+        await role.edit({ unicodeEmoji: resolvedEmoji });
+      }
+      await upsertBoosterCard(member, client, role).catch(() => null);
       await interaction.editReply({ content: `✅ Role icon set to ${resolvedEmoji}.` });
       return;
     }
@@ -367,20 +885,19 @@ export async function handleBoosterInteraction(
         await interaction.editReply({ content: '❌ Please provide a valid image URL starting with `https://`.' });
         return;
       }
-      // Validate the URL actually serves an image by checking Content-Type
       try {
         const res = await fetch(url, { method: 'HEAD' });
         const ct  = res.headers.get('content-type') ?? '';
         if (!ct.startsWith('image/')) {
-          await interaction.editReply({ content: '❌ That URL does not appear to serve an image. Make sure it is a direct link to a `.png`, `.jpg`, `.gif`, or `.webp` file.' });
+          await interaction.editReply({ content: '❌ That URL does not appear to serve an image.' });
           return;
         }
       } catch {
-        await interaction.editReply({ content: '❌ Could not reach that URL. Make sure it is a publicly accessible direct image link.' });
+        await interaction.editReply({ content: '❌ Could not reach that URL.' });
         return;
       }
       await role.edit({ icon: url });
-      await upsertBoosterCard(member, client, role);
+      await upsertBoosterCard(member, client, role).catch(() => null);
       await interaction.editReply({ content: '✅ Role icon updated.' });
       return;
     }
@@ -392,30 +909,25 @@ export async function handleBoosterInteraction(
         return;
       }
       const attachment = interaction.options.getAttachment('image', true);
-
-      // Validate it's an image
       const ct = attachment.contentType ?? '';
       if (!ct.startsWith('image/')) {
-        await interaction.editReply({ content: '❌ That file is not an image. Please upload a `.png`, `.jpg`, `.gif`, or `.webp` file.' });
+        await interaction.editReply({ content: '❌ That file is not an image.' });
         return;
       }
-
-      // Discord role icons must be under 256kb
       if (attachment.size > 256 * 1024) {
-        await interaction.editReply({ content: `❌ Image is too large (${Math.round(attachment.size / 1024)}kb). Role icons must be under **256kb**.` });
+        await interaction.editReply({ content: `❌ Image is too large (${Math.round(attachment.size / 1024)}kb). Must be under 256kb.` });
         return;
       }
-
       await role.edit({ icon: attachment.url, reason: 'Booster uploaded role icon' });
-      await upsertBoosterCard(member, client, role);
-      await interaction.editReply({ content: `✅ Role icon set from your uploaded image.` });
+      await upsertBoosterCard(member, client, role).catch(() => null);
+      await interaction.editReply({ content: '✅ Role icon set from your uploaded image.' });
       return;
     }
 
     // /booster icon clear
     if (group === 'icon' && sub === 'clear') {
       await role.edit({ icon: null, unicodeEmoji: null });
-      await upsertBoosterCard(member, client, role);
+      await upsertBoosterCard(member, client, role).catch(() => null);
       await interaction.editReply({ content: '✅ Role icon removed.' });
       return;
     }
@@ -444,7 +956,6 @@ export async function handleBoosterAdminInteraction(
     const channel = interaction.options.getChannel('channel', true);
     saveBoosterShowcaseChannel(interaction.guild.id, channel.id);
 
-    // Reposition ALL existing booster perk roles above the Server Booster role
     const targetPosition = getIdealBoosterRolePosition(interaction.guild, client.user!.id);
     const rows = getAllBoosterRoles(interaction.guild.id);
     let repositioned = 0;
@@ -481,17 +992,117 @@ export async function handleBoosterAdminInteraction(
       return;
     }
 
-    // Delete the perk role
     const role = interaction.guild.roles.cache.get(stored.roleId)
       ?? await interaction.guild.roles.fetch(stored.roleId).catch(() => null);
     if (role) await role.delete('Admin cleared booster role').catch(() => null);
     deleteBoosterRole(interaction.guild.id, user.id);
 
-    // Delete the showcase card
     const member = await interaction.guild.members.fetch(user.id).catch(() => null);
     if (member) await removeBoosterCard(member, interaction.guild);
 
     await interaction.editReply({ content: `✅ Removed booster role and card for **${user.tag}**.` });
+    return;
+  }
+
+  // /boosteradmin sync
+  if (sub === 'sync') {
+    await interaction.deferReply({ ephemeral: true });
+
+    const shouldPrune = interaction.options.getBoolean('prune') ?? true;
+    const guild       = interaction.guild;
+
+    await guild.members.fetch();
+    const currentBoosters = guild.members.cache.filter((m) => !!m.premiumSince);
+
+    let cardsPosted  = 0;
+    let rolesCreated = 0;
+    let cardsFailed  = 0;
+    let pruned       = 0;
+    const errors: string[] = [];
+
+    for (const [, boostMember] of currentBoosters) {
+      try {
+        const hadRecord = !!getBoosterRole(guild.id, boostMember.id);
+        const role      = await getOrCreateBoosterRole(boostMember, client);
+        if (!hadRecord) rolesCreated++;
+
+        const existingCardId = getBoosterCard(guild.id, boostMember.id);
+
+        if (existingCardId) {
+          const channelId = getBoosterShowcaseChannel(guild.id);
+          let messageExists = false;
+          if (channelId) {
+            const channel = await guild.channels.fetch(channelId).catch(() => null);
+            if (channel?.isTextBased()) {
+              const msg = await (channel as TextChannel).messages
+                .fetch(existingCardId)
+                .catch(() => null);
+              messageExists = !!msg;
+            }
+          }
+          if (!messageExists) {
+            deleteBoosterCard(guild.id, boostMember.id);
+            await upsertBoosterCard(boostMember, client, role);
+            cardsPosted++;
+          }
+        } else {
+          await upsertBoosterCard(boostMember, client, role);
+          cardsPosted++;
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        errors.push(`<@${boostMember.id}>: ${msg}`);
+        cardsFailed++;
+      }
+    }
+
+    if (shouldPrune) {
+      const allRecords = getAllBoosterRoles(guild.id);
+      for (const row of allRecords) {
+        if (currentBoosters.has(row.userId as Snowflake)) continue;
+        try {
+          const role = guild.roles.cache.get(row.roleId as Snowflake)
+            ?? await guild.roles.fetch(row.roleId).catch(() => null);
+          if (role) await role.delete('Booster sync prune').catch(() => null);
+          deleteBoosterRole(guild.id, row.userId);
+
+          const staleCardId = getBoosterCard(guild.id, row.userId);
+          if (staleCardId) {
+            const channelId = getBoosterShowcaseChannel(guild.id);
+            if (channelId) {
+              const channel = await guild.channels.fetch(channelId).catch(() => null);
+              if (channel?.isTextBased()) {
+                const msg = await (channel as TextChannel).messages
+                  .fetch(staleCardId)
+                  .catch(() => null);
+                if (msg) await msg.delete().catch(() => null);
+              }
+            }
+            deleteBoosterCard(guild.id, row.userId);
+          }
+          pruned++;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          errors.push(`Prune <@${row.userId}>: ${msg}`);
+        }
+      }
+    }
+
+    const lines: string[] = [
+      `**🔄 Booster sync complete**`,
+      `👥 Active boosters found: **${currentBoosters.size}**`,
+      `📬 Cards posted/restored: **${cardsPosted}**`,
+      `🎨 Roles created: **${rolesCreated}**`,
+    ];
+    if (shouldPrune) lines.push(`🗑 Stale records pruned: **${pruned}**`);
+    if (cardsFailed) lines.push(`⚠️ Failures: **${cardsFailed}**`);
+    if (errors.length) {
+      lines.push('', '**Errors:**');
+      lines.push(...errors.slice(0, 10).map((e) => `• ${e}`));
+      if (errors.length > 10) lines.push(`…and ${errors.length - 10} more`);
+    }
+
+    await interaction.editReply({ content: lines.join('\n') });
     return;
   }
 
@@ -520,16 +1131,13 @@ export async function handleBoostChange(
   const wasBoosting = !!oldMember.premiumSince;
   const nowBoosting = !!newMember.premiumSince;
 
-  // Started boosting — post the showcase card
   if (!wasBoosting && nowBoosting) {
-    // Give Discord a moment to fully register the boost
     await new Promise((r) => setTimeout(r, 2_000));
     const freshMember = await newMember.guild.members.fetch(newMember.id).catch(() => newMember);
     await upsertBoosterCard(freshMember, client, null);
     console.log(`💎 ${newMember.user.tag} started boosting — card posted`);
   }
 
-  // Stopped boosting — delete role + card
   if (wasBoosting && !nowBoosting) {
     const stored = getBoosterRole(newMember.guild.id, newMember.id);
     if (stored) {
@@ -538,7 +1146,6 @@ export async function handleBoostChange(
       if (role) await role.delete('User stopped boosting').catch(() => null);
       deleteBoosterRole(newMember.guild.id, newMember.id);
     }
-
     await removeBoosterCard(newMember, newMember.guild);
     console.log(`💔 ${newMember.user.tag} stopped boosting — card removed`);
   }

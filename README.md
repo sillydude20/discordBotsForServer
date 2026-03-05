@@ -23,4 +23,4 @@ logging edited messages and joins/ updates
 
 
 
-
+Need a name role command - like name the role it gives you for color right?
