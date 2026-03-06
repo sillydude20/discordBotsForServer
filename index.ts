@@ -56,6 +56,12 @@ import {
   loadMarkovConfig,
 } from './features/markov';
 import { sayCommand, handleSayInteraction } from './commands/say';
+// top of index.ts with other imports
+import { activityCommand, handleActivityInteraction, handleVoiceStateUpdate } from './features/activity';
+import { incrementMessageCount } from './utils/database';
+
+// ── Client ────────────────────────────────────────────────────
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -63,6 +69,8 @@ const client = new Client({
     GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildVoiceStates,
   ],
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
@@ -90,6 +98,7 @@ client.once('ready', async () => {
         setupRoleCommand.toJSON(),
         markovCommand.toJSON(),
         sayCommand.toJSON(),
+        activityCommand.toJSON(),
       ],
     },
   );
@@ -108,14 +117,12 @@ client.once('ready', async () => {
 // Called when a message @mentions the bot.
 // Handles two cases:
 //
-//   1. Reply to a human message + @bot (anything in the message, just needs the @)
+//   1. Reply to a human message + @bot
 //        → generate a quote image of the replied-to message
 //
 //   2. Reply to a bot message + @bot
-//        a. If the bot message is a quote image → do nothing (quote images
-//           aren't quotable themselves)
-//        b. Otherwise (markov message, command reply, etc.)
-//           → reply with a fresh markov generation
+//        a. If the bot message is a quote image → do nothing
+//        b. Otherwise → reply with a fresh markov generation
 
 async function handleBotMention(message: Message): Promise<void> {
   if (!message.guild) return;
@@ -128,37 +135,31 @@ async function handleBotMention(message: Message): Promise<void> {
     return;
   }
 
-  // Check if the user's message is ONLY the bot mention (ignoring whitespace).
-  // e.g. "@bot" with nothing else → they want a quote image.
-  // If they wrote actual text alongside the mention → treat as a conversational reply.
   const contentWithoutMention = message.content
     .replace(`<@${client.user!.id}>`, '')
     .replace(`<@!${client.user!.id}>`, '')
     .trim();
-  const isBaremention = contentWithoutMention.length === 0;
+  const isBareMention = contentWithoutMention.length === 0;
 
   // Replying to a bot message
   if (target.author.id === client.user!.id) {
-    // Quote images: in-memory set (current session) or attachment-only with no text (survives restarts)
     const isQuoteImage =
       quoteMsgIds.has(target.id) ||
       (target.attachments.size > 0 && !target.content);
 
-    if (isQuoteImage) return; // never quote a quote
+    if (isQuoteImage) return;
 
-    // Bare @mention on a bot message → quote it
-    if (isBaremention) {
+    if (isBareMention) {
       await handleQuoteRequest(message, target, client);
       return;
     }
 
-    // Message has content beyond the mention → markov reply
     const generated = generateMarkov(message.guild.id);
     if (generated) await message.reply(generated);
     return;
   }
 
-  // Replying to a human message → always quote regardless of extra text
+  // Replying to a human message → quote it
   await handleQuoteRequest(message, target, client);
 }
 
@@ -167,16 +168,13 @@ client.on('messageCreate', async (message) => {
   if (message.partial) return;
   if (message.author.bot) return;
 
-  // Autodelete timer
   handleMessage(message);
-
-  // Mod log
   logNewMessage(message);
-
-  // Markov learning + auto-interval (ignores bot replies — that's handleBotMention's job)
   handleMarkovMessage(message, client);
+  incrementMessageCount(message.guildId!, message.author.id);
 
-  // Bot mention handler — covers both quote and markov-reply cases
+  if (message.guild) incrementMessageCount(message.guild.id, message.author.id);
+
   if (message.mentions.has(client.user!.id)) {
     await handleBotMention(message);
   }
@@ -188,6 +186,29 @@ client.on('messageDelete', (message) => {
 
 client.on('messageDeleteBulk', (messages, channel) => {
   logBulkDelete(messages, channel as TextChannel);
+});
+
+client.on('messageUpdate', (oldMessage, newMessage) => {
+  logEditedMessage(oldMessage, newMessage);
+});
+
+// ── Voice ─────────────────────────────────────────────────────
+client.on('voiceStateUpdate', (oldState, newState) => {
+  handleVoiceStateUpdate(oldState, newState);
+});
+
+// ── Members ───────────────────────────────────────────────────
+client.on('guildMemberAdd', (member) => {
+  logMemberJoin(member as any);
+});
+
+client.on('guildMemberRemove', (member) => {
+  logMemberLeave(member as any);
+});
+
+client.on('guildMemberUpdate', (oldMember, newMember) => {
+  handleBoostChange(oldMember as any, newMember as any, client);
+  logRoleUpdate(oldMember as any, newMember as any);
 });
 
 // ── Interactions ──────────────────────────────────────────────
@@ -205,7 +226,8 @@ client.on('interactionCreate', async (interaction) => {
 
   const cmd = interaction.commandName;
 
-  // Open to everyone
+  // ── Public commands ──────────────────────────────────────────
+
   if (cmd === 'confession') {
     await confessionCommand.execute(interaction);
     return;
@@ -216,13 +238,19 @@ client.on('interactionCreate', async (interaction) => {
     return;
   }
 
-  // Open to all, internally checks boost status
+  // Internally checks boost status
   if (cmd === 'booster') {
     await handleBoosterInteraction(interaction, client);
     return;
   }
 
-  // Admin-gated commands ─────────────────────────────────────
+  // Public stats/leaderboard/graph — import is gated inside the handler
+  if (cmd === 'activity') {
+    await handleActivityInteraction(interaction);
+    return;
+  }
+
+  // ── Admin-gated commands ─────────────────────────────────────
 
   if (cmd === 'autodelete') {
     if (!await checkAdminRole(interaction)) return;
@@ -247,37 +275,18 @@ client.on('interactionCreate', async (interaction) => {
     await handleMarkovInteraction(interaction);
     return;
   }
+
   if (cmd === 'say') {
     if (!await checkAdminRole(interaction)) return;
     await handleSayInteraction(interaction);
     return;
   }
 
-  // Starboard and collection commands
+  // Starboard + confession config (collection-based commands)
   const command = commands.get(cmd);
   if (!command) return;
   if (!await checkAdminRole(interaction)) return;
   await command.execute(interaction as ChatInputCommandInteraction);
 });
 
-// ── Edited messages ───────────────────────────────────────────
-client.on('messageUpdate', (oldMessage, newMessage) => {
-  logEditedMessage(oldMessage, newMessage);
-});
-
-// ── Member join / leave ───────────────────────────────────────
-client.on('guildMemberAdd', (member) => {
-  logMemberJoin(member as any);
-});
-
-client.on('guildMemberRemove', (member) => {
-  logMemberLeave(member as any);
-});
-
-// ── Boost detection & role updates ───────────────────────────
-client.on('guildMemberUpdate', (oldMember, newMember) => {
-  handleBoostChange(oldMember as any, newMember as any, client);
-  logRoleUpdate(oldMember as any, newMember as any);
-});
-
-client.login(process.env.BOT_TOKEN);
+client.login(process.env.BOT_TOKEN!);

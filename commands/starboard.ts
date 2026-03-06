@@ -2,9 +2,11 @@ import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
   PermissionFlagsBits,
-  ChannelType
+  ChannelType,
+  EmbedBuilder,
+  GuildMember,
 } from "discord.js";
-import { getStarboardConfig, setStarboardConfig } from "../utils/database";
+import { getStarboardConfig, setStarboardConfig, getAllStarboardMessages, deleteStarboardMessage, saveStarboardMessage, getCachedMessageById } from "../utils/database";
 
 
 
@@ -53,9 +55,13 @@ export const data = new SlashCommandBuilder()
           .setRequired(true)
       )
   )
+  
   .addSubcommand(sub =>
     sub.setName("status")
       .setDescription("View current starboard configuration")
+  ).addSubcommand(sub =>
+  sub.setName("refresh")
+    .setDescription("Repost any starboard entries missing from the starboard channel")
   );
 
 export async function execute(interaction: ChatInputCommandInteraction) {
@@ -111,5 +117,128 @@ export async function execute(interaction: ChatInputCommandInteraction) {
       content: `📌 **Starboard Config**\nChannel: <#${config.channelId}>\nThreshold: **${config.threshold}** ⭐\nAllowed channels: ${channels}`,
       ephemeral: true
     });
+  }  else if (sub === "refresh") {
+  await interaction.deferReply({ ephemeral: true });
+
+  if (!config.channelId) {
+    await interaction.editReply({ content: "⚠️ Starboard is not configured. Use `/starboard setchannel` first." });
+    return;
   }
+
+  const starboardChannel = interaction.guild!.channels.cache.get(config.channelId)
+    ?? await interaction.guild!.channels.fetch(config.channelId).catch(() => null);
+
+  if (!starboardChannel?.isTextBased()) {
+    await interaction.editReply({ content: `❌ Starboard channel <#${config.channelId}> not found. Set a new one with \`/starboard setchannel\`.` });
+    return;
+  }
+
+  const rows = getAllStarboardMessages(guildId);
+
+  if (rows.length === 0) {
+    await interaction.editReply({ content: "ℹ️ No starboard entries in the database." });
+    return;
+  }
+
+  let intact = 0, reposted = 0, failed = 0;
+
+  for (const row of rows) {
+    const stillExists = await starboardChannel.messages.fetch(row.starboardMessageId).catch(() => null);
+    if (stillExists) { intact++; continue; }
+
+    // Stale entry — remove it
+    deleteStarboardMessage(row.messageId);
+
+    // Look up original message details from the mod-log cache
+    const cached = getCachedMessageById(row.messageId);
+    if (!cached) { failed++; continue; }
+
+    try {
+      const originChannel = interaction.guild!.channels.cache.get(cached.channelId)
+        ?? await interaction.guild!.channels.fetch(cached.channelId).catch(() => null);
+      if (!originChannel?.isTextBased()) { failed++; continue; }
+
+      const originalMsg = await originChannel.messages.fetch(row.messageId).catch(() => null);
+      if (!originalMsg) { failed++; continue; }
+
+      const member = await interaction.guild!.members.fetch(cached.authorId).catch(() => null);
+      if (!member) { failed++; continue; }
+
+      const starReaction = originalMsg.reactions.cache.get("⭐");
+      const starCount = starReaction?.count ?? 0;
+
+      const embed = await buildStarboardEmbed(originalMsg, starCount, member);
+      const sent = await starboardChannel.send({
+        content: `⭐ **${starCount}** <#${cached.channelId}>`,
+        embeds: [embed]
+      });
+      saveStarboardMessage(row.messageId, sent.id, guildId);
+      reposted++;
+    } catch (e) {
+      console.warn("[starboard refresh] Failed to repost:", e);
+      failed++;
+    }
+  }
+
+  await interaction.editReply({
+    content:
+      `✅ **Starboard refresh complete**\n` +
+      `📋 Total tracked: **${rows.length}**\n` +
+      `✔️ Already intact: **${intact}**\n` +
+      `📌 Reposted: **${reposted}**` +
+      (failed > 0 ? `\n⚠️ Could not restore: **${failed}** (original message deleted or channel gone)` : ""),
+  });
+}
+  
+}
+
+function formatContent(content: string): string {
+  if (!content) return "*No text content*";
+  content = content.replace(/<a?:(\w+):(\d+)>/g, (match, name, id) => {
+    const ext = match.startsWith("<a:") ? "gif" : "png";
+    return `[:${name}:](https://cdn.discordapp.com/emojis/${id}.${ext})`;
+  });
+  return content;
+}
+
+async function buildStarboardEmbed(message: any, starCount: number, member: GuildMember) {
+  const embed = new EmbedBuilder()
+    .setAuthor({ name: member.displayName, iconURL: member.displayAvatarURL() })
+    .setColor(0xFFAC33);
+
+  if (message.reference?.messageId) {
+    try {
+      const repliedTo = await message.channel.messages.fetch(message.reference.messageId);
+      const repliedMember = await message.guild.members.fetch(repliedTo.author.id);
+      embed.addFields({
+        name: `↩️ Replying to ${repliedMember.displayName}`,
+        value: repliedTo.content || "*No text content*"
+      });
+    } catch {}
+  }
+
+  embed
+    .addFields({ name: message.content || "*No text content*", value: "", inline: true })
+    .setFooter({ text: `🦀 Reactions ${starCount}` })
+    .setTimestamp(message.createdAt);
+
+  const image = message.attachments.first();
+  if (image?.contentType?.startsWith("image/")) embed.setImage(image.url);
+
+  const sticker = message.stickers?.first();
+  if (sticker) {
+    embed.setImage(`https://media.discordapp.net/stickers/${sticker.id}.png`);
+    if (!message.content) embed.setTitle(`🎭 Sticker: ${sticker.name}`);
+  }
+
+  const tenorMatch = message.content?.match(/https:\/\/tenor\.com\/view\/[^\s]+/);
+  if (tenorMatch) { embed.setImage(tenorMatch[0]); embed.setTitle(null); }
+
+  if (message.embeds?.length > 0) {
+    const first = message.embeds[0];
+    if (first.image) embed.setImage(first.image.url);
+    else if (first.thumbnail) embed.setImage(first.thumbnail.url);
+  }
+
+  return embed;
 }
