@@ -171,7 +171,7 @@ client.on('messageCreate', async (message) => {
   handleMessage(message);
   logNewMessage(message);
   handleMarkovMessage(message, client);
-  incrementMessageCount(message.guildId!, message.author.id);
+  // incrementMessageCount(message.guildId!, message.author.id);
 
   if (message.guild) incrementMessageCount(message.guild.id, message.author.id);
 

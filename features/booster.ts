@@ -396,14 +396,22 @@ async function applyRoleChanges(
   if (state.color != null) edits.color = state.color;
 
   if (state.icon != null) {
-    const customEmojiMatch = state.icon.match(/^<a?:\w+:(\d+)>$/);
-    if (customEmojiMatch) {
-      // Custom server emoji — pass its CDN image URL as the role icon
-      edits.icon = `https://cdn.discordapp.com/emojis/${customEmojiMatch[1]}.png`;
-    } else {
-      edits.icon = state.icon;
+  const customEmojiMatch = state.icon.match(/^<a?:\w+:(\d+)>$/);
+  if (customEmojiMatch) {
+    edits.icon = `https://cdn.discordapp.com/emojis/${customEmojiMatch[1]}.png`;
+  } else if (state.icon.startsWith('https://')) {
+    // Download to buffer so Discord doesn't reject expired or CDN URLs
+    try {
+      const res = await fetch(state.icon);
+      const arrayBuffer = await res.arrayBuffer();
+      edits.icon = Buffer.from(arrayBuffer);
+    } catch {
+      edits.icon = state.icon; // fallback to URL if fetch fails
     }
+  } else {
+    edits.icon = state.icon;
   }
+}
 
   if (Object.keys(edits).length > 0) {
     await role.edit({ ...edits, reason: 'Booster guided setup' });

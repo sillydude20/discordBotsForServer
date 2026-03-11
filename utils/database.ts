@@ -550,3 +550,17 @@ export function importActivityCounts(guildId: string, counts: Map<string, number
 
   importAll();
 }
+
+export function getTopUsersFromCache(guildId: string, limit = 10): { userId: string; totalMessages: number }[] {
+  return (db.prepare(`
+    SELECT author_id, COUNT(*) as total_messages
+    FROM modlog_message_cache
+    WHERE guild_id = ?
+    GROUP BY author_id
+    ORDER BY total_messages DESC
+    LIMIT ?
+  `).all(guildId, limit) as any[]).map(row => ({
+    userId: row.author_id,
+    totalMessages: row.total_messages,
+  }));
+}

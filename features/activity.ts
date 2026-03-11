@@ -27,6 +27,7 @@ import {
   getTopUsers,
   getModlogMessagesForImport,
   importActivityCounts,
+  getTopUsersFromCache,
 } from '../utils/database';
 
 // ── Voice session tracking ────────────────────────────────────
@@ -38,9 +39,9 @@ export function handleVoiceStateUpdate(oldState: VoiceState, newState: VoiceStat
   const guildId = newState.guild.id;
   const key     = `${guildId}:${userId}`;
 
-  const joinedChannel  = !oldState.channelId && newState.channelId;
-  const leftChannel    = oldState.channelId  && !newState.channelId;
-  const switchedChannel = oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId;
+  const joinedChannel   = !oldState.channelId && newState.channelId;
+  const leftChannel     = oldState.channelId  && !newState.channelId;
+  const switchedChannel = oldState.channelId  && newState.channelId && oldState.channelId !== newState.channelId;
 
   if (joinedChannel) {
     voiceSessions.set(key, Date.now());
@@ -55,11 +56,10 @@ export function handleVoiceStateUpdate(oldState: VoiceState, newState: VoiceStat
       console.log(`🎙 [voice] ${userId} left voice — ${seconds}s tracked, writing to DB`);
       if (seconds > 0) addVoiceSeconds(guildId, userId, seconds);
       voiceSessions.delete(key);
-    }else {
-        console.log(`🎙 [voice] ${userId} left voice but had no session tracked (bot was offline when they joined)`);
+    } else {
+      console.log(`🎙 [voice] ${userId} left voice but had no session tracked (bot was offline when they joined)`);
     }
     if (switchedChannel) {
-      // start a new session in the new channel
       voiceSessions.set(key, Date.now());
       console.log(`🎙 [voice] ${userId} switched channels, new session started`);
     }
@@ -151,10 +151,10 @@ async function generateActivityGraph(
   const voicePoints: { x: number; y: number }[] = [];
 
   for (let i = 0; i < n; i++) {
-    const d     = allDays[i];
-    const x     = PAD.left + (i / n) * chartW + barW / 2;
-    const barH  = (d.totalMessages / maxMsg) * chartH;
-    const barY  = PAD.top + chartH - barH;
+    const d      = allDays[i];
+    const x      = PAD.left + (i / n) * chartW + barW / 2;
+    const barH   = (d.totalMessages / maxMsg) * chartH;
+    const barY   = PAD.top + chartH - barH;
     const voiceY = PAD.top + chartH - (d.totalVoiceHours / maxVoice) * chartH;
 
     // Message bar
@@ -229,9 +229,9 @@ export const activityCommand = new SlashCommandBuilder()
       .setDescription('Top 10 most active members'),
   )
   .addSubcommand(sub =>
-  sub.setName('import')
-    .setDescription('Import historical message counts from the mod-log cache into activity stats'),
-)
+    sub.setName('import')
+      .setDescription('Import historical message counts from the mod-log cache into activity stats'),
+  )
   .addSubcommand(sub =>
     sub.setName('graph')
       .setDescription('Server activity graph')
@@ -265,8 +265,8 @@ export async function handleActivityInteraction(
       .setTitle(`📊 Activity — ${member?.displayName ?? target.username}`)
       .setThumbnail(target.displayAvatarURL())
       .addFields(
-        { name: '💬 Total Messages', value: totals.totalMessages.toLocaleString(),    inline: true },
-        { name: '🎙 Voice Hours',    value: `${totals.totalVoiceHours.toFixed(2)}h`,  inline: true },
+        { name: '💬 Total Messages', value: totals.totalMessages.toLocaleString(),   inline: true },
+        { name: '🎙 Voice Hours',    value: `${totals.totalVoiceHours.toFixed(2)}h`, inline: true },
       )
       .setFooter({ text: 'Tracking started when the bot joined' });
 
@@ -276,18 +276,24 @@ export async function handleActivityInteraction(
 
   // /activity leaderboard
   if (sub === 'leaderboard') {
-    const top    = getTopUsers(interaction.guild.id, 10);
+    await interaction.deferReply();
+
+    const top = getTopUsersFromCache(interaction.guild.id, 10);
     if (!top.length) {
-      await interaction.reply({ content: 'ℹ️ No activity data yet.', ephemeral: true });
+      await interaction.editReply({ content: 'ℹ️ No activity data yet.' });
       return;
     }
 
-    const lines = await Promise.all(top.map(async (u, i) => {
-      const member = await interaction.guild!.members.fetch(u.userId).catch(() => null);
-      const name   = member?.displayName ?? `<@${u.userId}>`;
-      const medal  = ['🥇','🥈','🥉'][i] ?? `${i + 1}.`;
-      return `${medal} **${name}** — ${u.totalMessages.toLocaleString()} msgs · ${u.totalVoiceHours.toFixed(1)}h voice`;
-    }));
+    // Fetch all members in one request, then use cache for lookups
+    await interaction.guild.members.fetch();
+
+    const lines = top.map((u, i) => {
+      const member = interaction.guild!.members.cache.get(u.userId);
+      const name = `<@${u.userId}>`;
+      const medal  = ['🥇', '🥈', '🥉'][i] ?? `${i + 1}.`;
+      const voice  = getUserTotals(interaction.guild!.id, u.userId);
+      return `${medal} **${name}** — ${u.totalMessages.toLocaleString()} msgs · ${voice.totalVoiceHours.toFixed(1)}h voice`;
+    });
 
     const embed = new EmbedBuilder()
       .setColor(Colors.Gold)
@@ -295,7 +301,7 @@ export async function handleActivityInteraction(
       .setDescription(lines.join('\n'))
       .setFooter({ text: interaction.guild.name });
 
-    await interaction.reply({ embeds: [embed] });
+    await interaction.editReply({ embeds: [embed] });
     return;
   }
 
@@ -316,42 +322,43 @@ export async function handleActivityInteraction(
       const msg = err instanceof Error ? err.message : String(err);
       await interaction.editReply({ content: `❌ Failed to generate graph: ${msg}` });
     }
+    return;
   }
+
   // /activity import
-if (sub === 'import') {
-  await interaction.deferReply({ ephemeral: true });
+  if (sub === 'import') {
+    await interaction.deferReply({ ephemeral: true });
 
-  try {
-    const rows = getModlogMessagesForImport(interaction.guild.id);
+    try {
+      const rows = getModlogMessagesForImport(interaction.guild.id);
 
-    if (rows.length === 0) {
-      await interaction.editReply('ℹ️ No messages found in the mod-log cache for this server.');
-      return;
+      if (rows.length === 0) {
+        await interaction.editReply('ℹ️ No messages found in the mod-log cache for this server.');
+        return;
+      }
+
+      const counts = new Map<string, number>();
+      for (const row of rows) {
+        const date = new Date(row.createdTimestamp).toISOString().slice(0, 10);
+        const key  = `${date}:${row.authorId}`;
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+
+      importActivityCounts(interaction.guild.id, counts);
+
+      const uniqueDays  = new Set([...counts.keys()].map(k => k.slice(0, 10))).size;
+      const uniqueUsers = new Set([...counts.keys()].map(k => k.slice(11))).size;
+
+      await interaction.editReply(
+        `✅ Import complete.\n` +
+        `**${rows.length.toLocaleString()}** messages processed\n` +
+        `**${uniqueUsers}** unique users\n` +
+        `**${uniqueDays}** days of history\n\n` +
+        `You can now use \`/activity graph\` and \`/activity leaderboard\`.`,
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await interaction.editReply(`❌ Import failed: ${msg}`);
     }
-
-    const counts = new Map<string, number>();
-    for (const row of rows) {
-      const date = new Date(row.createdTimestamp).toISOString().slice(0, 10);
-      const colonIndex = `${date}:${row.authorId}`.indexOf(':');
-      const key = `${date}:${row.authorId}`;
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
-
-    importActivityCounts(interaction.guild.id, counts);
-
-    const uniqueDays  = new Set([...counts.keys()].map(k => k.slice(0, 10))).size;
-    const uniqueUsers = new Set([...counts.keys()].map(k => k.slice(11))).size;
-
-    await interaction.editReply(
-      `✅ Import complete.\n` +
-      `**${rows.length.toLocaleString()}** messages processed\n` +
-      `**${uniqueUsers}** unique users\n` +
-      `**${uniqueDays}** days of history\n\n` +
-      `You can now use \`/activity graph\` and \`/activity leaderboard\`.`
-    );
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await interaction.editReply(`❌ Import failed: ${msg}`);
   }
-}
 }
