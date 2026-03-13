@@ -57,8 +57,15 @@ import {
 } from './features/markov';
 import { sayCommand, handleSayInteraction } from './commands/say';
 // top of index.ts with other imports
-import { activityCommand, handleActivityInteraction, handleVoiceStateUpdate } from './features/activity';
-import { incrementMessageCount } from './utils/database';
+import {
+  activityCommand,
+  handleActivityInteraction,
+  handleVoiceStateUpdate,
+  handleActivityMessage,   // NEW — replaces direct incrementMessageCount call
+  loadActivityConfig,      // NEW
+  startVoiceFlushLoop,     // NEW
+} from './features/activity';
+// import { incrementMessageCount } from './utils/database';
 
 // ── Client ────────────────────────────────────────────────────
 
@@ -69,7 +76,6 @@ const client = new Client({
     GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildVoiceStates,
   ],
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
@@ -102,6 +108,7 @@ client.once('ready', async () => {
       ],
     },
   );
+  
   console.log('✅ Slash commands registered');
 
   setupStarboard(client);
@@ -111,6 +118,8 @@ client.once('ready', async () => {
   loadMarkovConfig();
   await checkAuditLogPermission(client);
   startSweepLoop(client);
+  loadActivityConfig("1477702227899715596");
+  startVoiceFlushLoop();
 });
 
 // ── Bot mention handler ───────────────────────────────────────
@@ -171,9 +180,10 @@ client.on('messageCreate', async (message) => {
   handleMessage(message);
   logNewMessage(message);
   handleMarkovMessage(message, client);
-  // incrementMessageCount(message.guildId!, message.author.id);
 
-  if (message.guild) incrementMessageCount(message.guild.id, message.author.id);
+  if (message.guild) {
+        handleActivityMessage(message.guild.id, message.author.id, message.channelId);
+      }
 
   if (message.mentions.has(client.user!.id)) {
     await handleBotMention(message);

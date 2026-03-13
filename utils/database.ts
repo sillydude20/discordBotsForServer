@@ -7,6 +7,19 @@ const db = new Database(path.join(__dirname, "../../data/bot.db"));
 // Run once on startup to create tables
 function initDatabase() {
   db.exec(`
+        CREATE TABLE IF NOT EXISTS activity_stats (
+      guild_id   TEXT NOT NULL,
+      user_id    TEXT NOT NULL,
+      msg_count  INTEGER NOT NULL DEFAULT 0,
+      voice_secs INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (guild_id, user_id)
+    );
+    
+    CREATE TABLE IF NOT EXISTS activity_tracked_channels (
+      guild_id   TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      PRIMARY KEY (guild_id, channel_id)
+    );
     CREATE TABLE IF NOT EXISTS starboard_config (
       guild_id TEXT PRIMARY KEY,
       channel_id TEXT NOT NULL,
@@ -76,14 +89,6 @@ function initDatabase() {
     CREATE TABLE IF NOT EXISTS autodelete_ignored_messages (
       message_id TEXT PRIMARY KEY,
       guild_id   TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS activity_stats (
-      guild_id    TEXT NOT NULL,
-      date        TEXT NOT NULL,   -- 'YYYY-MM-DD'
-      user_id     TEXT NOT NULL,
-      msg_count   INTEGER NOT NULL DEFAULT 0,
-      voice_secs  INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (guild_id, date, user_id)
     );
   `);
 }
@@ -412,80 +417,51 @@ export function deleteAutoDeleteIgnoredMessage(messageId: string): void {
 // ─── Activity Stats ──────────────────────────────────────────
 
 export function incrementMessageCount(guildId: string, userId: string): void {
-  const date = new Date().toISOString().slice(0, 10);
   db.prepare(`
-    INSERT INTO activity_stats (guild_id, date, user_id, msg_count, voice_secs)
-    VALUES (?, ?, ?, 1, 0)
-    ON CONFLICT(guild_id, date, user_id) DO UPDATE SET msg_count = msg_count + 1
-  `).run(guildId, userId, date);
+    INSERT INTO activity_stats (guild_id, user_id, msg_count, voice_secs)
+    VALUES (?, ?, 1, 0)
+    ON CONFLICT(guild_id, user_id) DO UPDATE SET msg_count = msg_count + 1
+  `).run(guildId, userId);
 }
-
+ 
 export function addVoiceSeconds(guildId: string, userId: string, seconds: number): void {
-  const date = new Date().toISOString().slice(0, 10);
   db.prepare(`
-    INSERT INTO activity_stats (guild_id, date, user_id, msg_count, voice_secs)
-    VALUES (?, ?, ?, 0, ?)
-    ON CONFLICT(guild_id, date, user_id) DO UPDATE SET voice_secs = voice_secs + ?
-  `).run(guildId, userId, date, seconds, seconds);
+    INSERT INTO activity_stats (guild_id, user_id, msg_count, voice_secs)
+    VALUES (?, ?, 0, ?)
+    ON CONFLICT(guild_id, user_id) DO UPDATE SET voice_secs = voice_secs + ?
+  `).run(guildId, userId, seconds, seconds);
 }
-
-export interface DailyActivity {
-  date: string;
-  totalMessages: number;
-  totalVoiceHours: number;
-}
-
-export function getDailyActivity(guildId: string, days: number): DailyActivity[] {
-  return (db.prepare(`
-    SELECT date,
-           SUM(msg_count)  AS total_messages,
-           SUM(voice_secs) AS total_voice_secs
-    FROM activity_stats
-    WHERE guild_id = ?
-      AND date >= date('now', ? || ' days')
-    GROUP BY date
-    ORDER BY date ASC
-  `).all(guildId, `-${days}`) as any[]).map(row => ({
-    date:            row.date,
-    totalMessages:   row.total_messages,
-    totalVoiceHours: Math.round(row.total_voice_secs / 36) / 100, // 2 decimal hours
-  }));
-}
-
+ 
 export interface UserTotals {
   userId: string;
   totalMessages: number;
   totalVoiceHours: number;
 }
-
+ 
 export function getUserTotals(guildId: string, userId: string): UserTotals {
   const row = db.prepare(`
-    SELECT SUM(msg_count)  AS total_messages,
-           SUM(voice_secs) AS total_voice_secs
+    SELECT msg_count, voice_secs
     FROM activity_stats
     WHERE guild_id = ? AND user_id = ?
   `).get(guildId, userId) as any;
   return {
     userId,
-    totalMessages:   row?.total_messages   ?? 0,
-    totalVoiceHours: Math.round((row?.total_voice_secs ?? 0) / 36) / 100,
+    totalMessages:   row?.msg_count   ?? 0,
+    totalVoiceHours: Math.round((row?.voice_secs ?? 0) / 36) / 100,
   };
 }
-
+ 
 export function getTopUsers(guildId: string, limit = 10): UserTotals[] {
   return (db.prepare(`
-    SELECT user_id,
-           SUM(msg_count)  AS total_messages,
-           SUM(voice_secs) AS total_voice_secs
+    SELECT user_id, msg_count, voice_secs
     FROM activity_stats
     WHERE guild_id = ?
-    GROUP BY user_id
-    ORDER BY total_messages DESC
+    ORDER BY msg_count DESC
     LIMIT ?
   `).all(guildId, limit) as any[]).map(row => ({
     userId:          row.user_id,
-    totalMessages:   row.total_messages,
-    totalVoiceHours: Math.round(row.total_voice_secs / 36) / 100,
+    totalMessages:   row.msg_count,
+    totalVoiceHours: Math.round(row.voice_secs / 36) / 100,
   }));
 }
 
@@ -520,36 +496,36 @@ export function getCachedMessageById(messageId: string): CachedMessageRow | null
 
 // ─── Activity Import Helpers ─────────────────────────────────
 
-export function getModlogMessagesForImport(guildId: string): { authorId: string; createdTimestamp: number }[] {
-  return (db.prepare(`
-    SELECT author_id, created_timestamp
-    FROM modlog_message_cache
-    WHERE guild_id = ?
-  `).all(guildId) as any[]).map(row => ({
-    authorId:         row.author_id,
-    createdTimestamp: row.created_timestamp,
-  }));
-}
+// export function getModlogMessagesForImport(guildId: string): { authorId: string; createdTimestamp: number }[] {
+//   return (db.prepare(`
+//     SELECT author_id, created_timestamp
+//     FROM modlog_message_cache
+//     WHERE guild_id = ?
+//   `).all(guildId) as any[]).map(row => ({
+//     authorId:         row.author_id,
+//     createdTimestamp: row.created_timestamp,
+//   }));
+// }
 
-export function importActivityCounts(guildId: string, counts: Map<string, number>): void {
-  const upsert = db.prepare(`
-    INSERT INTO activity_stats (guild_id, date, user_id, msg_count, voice_secs)
-    VALUES (?, ?, ?, ?, 0)
-    ON CONFLICT(guild_id, date, user_id) DO UPDATE SET
-      msg_count = msg_count + excluded.msg_count
-  `);
+// export function importActivityCounts(guildId: string, counts: Map<string, number>): void {
+//   const upsert = db.prepare(`
+//     INSERT INTO activity_stats (guild_id, date, user_id, msg_count, voice_secs)
+//     VALUES (?, ?, ?, ?, 0)
+//     ON CONFLICT(guild_id, date, user_id) DO UPDATE SET
+//       msg_count = msg_count + excluded.msg_count
+//   `);
 
-  const importAll = db.transaction(() => {
-    for (const [key, count] of counts) {
-      const colonIndex = key.indexOf(':');
-      const date   = key.slice(0, colonIndex);
-      const userId = key.slice(colonIndex + 1);
-      upsert.run(guildId, date, userId, count);
-    }
-  });
+//   const importAll = db.transaction(() => {
+//     for (const [key, count] of counts) {
+//       const colonIndex = key.indexOf(':');
+//       const date   = key.slice(0, colonIndex);
+//       const userId = key.slice(colonIndex + 1);
+//       upsert.run(guildId, date, userId, count);
+//     }
+//   });
 
-  importAll();
-}
+//   importAll();
+// }
 
 export function getTopUsersFromCache(guildId: string, limit = 10): { userId: string; totalMessages: number }[] {
   return (db.prepare(`
@@ -564,3 +540,22 @@ export function getTopUsersFromCache(guildId: string, limit = 10): { userId: str
     totalMessages: row.total_messages,
   }));
 }
+
+export function getTrackedChannels(guildId: string): string[] {
+  return (db.prepare(`
+    SELECT channel_id FROM activity_tracked_channels WHERE guild_id = ?
+  `).all(guildId) as any[]).map(r => r.channel_id);
+}
+ 
+export function addTrackedChannel(guildId: string, channelId: string): void {
+  db.prepare(`
+    INSERT OR IGNORE INTO activity_tracked_channels (guild_id, channel_id) VALUES (?, ?)
+  `).run(guildId, channelId);
+}
+ 
+export function removeTrackedChannel(guildId: string, channelId: string): void {
+  db.prepare(`
+    DELETE FROM activity_tracked_channels WHERE guild_id = ? AND channel_id = ?
+  `).run(guildId, channelId);
+}
+
