@@ -559,3 +559,11 @@ export function removeTrackedChannel(guildId: string, channelId: string): void {
   `).run(guildId, channelId);
 }
 
+export function getRecentMessagesByUser(guildId: string, userId: string,): string[] {
+  return (db.prepare(`
+    SELECT content FROM modlog_message_cache
+    WHERE guild_id = ? AND author_id = ? AND length(content) > 10
+    ORDER BY created_timestamp DESC
+    LIMIT 1000
+    `).all(guildId, userId,) as any[]).map(row => row.content);
+}

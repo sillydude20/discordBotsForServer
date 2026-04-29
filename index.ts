@@ -67,6 +67,9 @@ import {
 } from './features/activity';
 
 import { handleGifOverlay } from './features/gifOverlay';
+
+import { handleOllamaReply } from './features/ollama'; 
+
 // import { incrementMessageCount } from './utils/database';
 
 // ── Client ────────────────────────────────────────────────────
@@ -137,20 +140,23 @@ client.once('ready', async () => {
 
 async function handleBotMention(message: Message): Promise<void> {
   if (!message.guild) return;
-  if (!message.reference?.messageId) return;
-
-  let target: Message;
-  try {
-    target = await message.channel.messages.fetch(message.reference.messageId);
-  } catch {
-    return;
-  }
 
   const contentWithoutMention = message.content
     .replace(`<@${client.user!.id}>`, '')
     .replace(`<@!${client.user!.id}>`, '')
     .trim();
   const isBareMention = contentWithoutMention.length === 0;
+
+  // ── NEW: if they @mention the bot with text but no reply, ask Ollama ──
+  if (!message.reference?.messageId) return;
+
+  // ── existing reply-based logic below, unchanged ──
+  let target: Message;
+  try {
+    target = await message.channel.messages.fetch(message.reference.messageId);
+  } catch {
+    return;
+  }
 
   // Replying to a bot message
   if (target.author.id === client.user!.id) {
@@ -165,9 +171,7 @@ async function handleBotMention(message: Message): Promise<void> {
       return;
     }
 
-    const generated = generateMarkov(message.guild.id);
-    if (generated) await message.reply(generated);
-    return;
+  return;
   }
 
   // Replying to a human message → quote it
@@ -183,6 +187,15 @@ client.on('messageCreate', async (message) => {
   await handleGifOverlay(message);
   return;
 }
+  if (message.content.startsWith('!roast')) {
+  const target = message.mentions.users.first();
+  if (!target) {
+    await message.reply('Usage: `!roast @user`');
+    return;
+  }
+  await handleOllamaReply(message, `<@${target.id}>`, target.toString());
+  return;
+}
 
   handleMessage(message);
   logNewMessage(message);
@@ -195,6 +208,8 @@ client.on('messageCreate', async (message) => {
   if (message.mentions.has(client.user!.id)) {
     await handleBotMention(message);
   }
+
+  
 });
 
 client.on('messageDelete', (message) => {

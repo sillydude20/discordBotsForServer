@@ -62,6 +62,23 @@ export function hasAdminRole(interaction: ChatInputCommandInteraction): boolean 
   return false;
 }
 
+// Message-based version of hasAdminRole (for !commands, not slash commands)
+export function hasAdminRoleMember(member: GuildMember): boolean {
+  if (!member.guild) return false;
+
+  // Server owner always passes
+  if (member.guild.ownerId === member.id) return true;
+
+  // ManageGuild permission always passes
+  if (member.permissions.has(PermissionFlagsBits.ManageGuild)) return true;
+
+  // Check configured admin role
+  const roleId = adminRoleCache.get(member.guild.id);
+  if (roleId && member.roles.cache.has(roleId)) return true;
+
+  return false;
+}
+
 // Sends a standardised denial reply and returns false — use like:
 //   if (!await checkAdminRole(interaction)) return;
 export async function checkAdminRole(
