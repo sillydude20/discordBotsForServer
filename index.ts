@@ -65,6 +65,8 @@ import {
   loadActivityConfig,      // NEW
   startVoiceFlushLoop,     // NEW
 } from './features/activity';
+
+import { handleGifOverlay } from './features/gifOverlay';
 // import { incrementMessageCount } from './utils/database';
 
 // ── Client ────────────────────────────────────────────────────
@@ -176,6 +178,11 @@ async function handleBotMention(message: Message): Promise<void> {
 client.on('messageCreate', async (message) => {
   if (message.partial) return;
   if (message.author.bot) return;
+
+  if (message.content.startsWith('!cum')) {
+  await handleGifOverlay(message);
+  return;
+}
 
   handleMessage(message);
   logNewMessage(message);
