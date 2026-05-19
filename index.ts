@@ -70,6 +70,8 @@ import { handleGifOverlay } from './features/gifOverlay';
 
 import { handleOllamaReply } from './features/ollama'; 
 
+import { announceCommand, handleAnnounce, handleAnnounceModal } from './commands/announce';
+
 // import { incrementMessageCount } from './utils/database';
 
 // ── Client ────────────────────────────────────────────────────
@@ -110,6 +112,7 @@ client.once('ready', async () => {
         markovCommand.toJSON(),
         sayCommand.toJSON(),
         activityCommand.toJSON(),
+        announceCommand.toJSON(),
       ],
     },
   );
@@ -252,6 +255,13 @@ client.on('interactionCreate', async (interaction) => {
     return;
   }
 
+  if (interaction.isModalSubmit()) {
+  if (interaction.customId === 'announce_modal') {
+    await handleAnnounceModal(interaction);
+    return;
+  }
+}
+
   if (!interaction.isChatInputCommand()) return;
 
   await logCommandUsage(interaction);
@@ -313,6 +323,12 @@ client.on('interactionCreate', async (interaction) => {
     await handleSayInteraction(interaction);
     return;
   }
+
+  if (cmd === 'announce') {
+  if (!await checkAdminRole(interaction)) return;
+  await handleAnnounce(interaction);
+  return;
+}
 
   // Starboard + confession config (collection-based commands)
   const command = commands.get(cmd);

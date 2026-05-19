@@ -144,7 +144,9 @@ export async function handleMarkovMessage(message: Message, client: Client): Pro
       messageCounts.set(message.guild.id, 0);
       const generated = generateMarkov(message.guild.id);
       if (generated) {
-        await (message.channel as TextChannel).send(generated);
+        await (message.channel as TextChannel).send({
+          content: generated, allowedMentions: { parse: [] },
+});
       }
     }
   }
