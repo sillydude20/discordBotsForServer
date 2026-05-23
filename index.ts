@@ -181,6 +181,42 @@ async function handleBotMention(message: Message): Promise<void> {
   await handleQuoteRequest(message, target, client);
 }
 
+async function handleVoiceTranscribe(message: Message): Promise<void> {
+  const att = message.attachments.first();
+  if (!att) return;
+
+  const isVoiceMessage =
+    att.name === "voice-message.ogg" ||
+    (att.contentType?.startsWith("audio/ogg") ?? false);
+
+  if (!isVoiceMessage) return;
+
+  console.log(`[voiceTranscribe] Voice message from ${message.author.username}`);
+
+  try {
+    const audioRes = await fetch(att.url);
+    const audioBuffer = await audioRes.arrayBuffer();
+
+    const res = await fetch("http://localhost:5001/transcribe", {
+      method: "POST",
+      body: Buffer.from(audioBuffer),
+      headers: { "Content-Type": "application/octet-stream" },
+    });
+
+    const { transcript } = await res.json() as { transcript: string };
+
+    if (!transcript) {
+      await message.reply("🎙️ I couldn't make out anything in that voice message.");
+      return;
+    }
+
+    await message.reply(transcript);
+  } catch (e) {
+    console.error("[voiceTranscribe] Error:", e);
+    await message.reply("❌ Failed to transcribe the voice message.");
+  }
+}
+
 // ── Messages ──────────────────────────────────────────────────
 client.on('messageCreate', async (message) => {
   if (message.partial) return;
@@ -203,6 +239,7 @@ client.on('messageCreate', async (message) => {
   handleMessage(message);
   logNewMessage(message);
   handleMarkovMessage(message, client);
+  await handleVoiceTranscribe(message);
 
   if (message.guild) {
         handleActivityMessage(message.guild.id, message.author.id, message.channelId);
