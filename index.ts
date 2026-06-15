@@ -71,6 +71,8 @@ import { handleGifOverlay } from './features/gifOverlay';
 import { handleOllamaReply } from './features/ollama'; 
 
 import { announceCommand, handleAnnounce, handleAnnounceModal } from './commands/announce';
+// Add to imports at the top
+import { handleXFixer } from './features/xFixer';
 
 // import { incrementMessageCount } from './utils/database';
 const voiceWebhookCache = new Map<string, string>(); // channelId -> webhookId
@@ -253,6 +255,8 @@ client.on('messageCreate', async (message) => {
   await handleOllamaReply(message, `<@${target.id}>`, target.toString());
   return;
 }
+  // ── X/Twitter fixer — runs before log so deleted msg isn't logged ──
+  await handleXFixer(message, voiceWebhookCache); // reuses the same cache
 
   handleMessage(message);
   logNewMessage(message);
