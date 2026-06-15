@@ -1,10 +1,10 @@
 import io
 import asyncio
+import requests
 from flask import Flask, request, jsonify
 from faster_whisper import WhisperModel
 
 app = Flask(__name__)
-
 print("[whisper] Loading model...")
 model = WhisperModel("small", device="cpu", compute_type="int8")
 print("[whisper] Model loaded")

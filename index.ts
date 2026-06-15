@@ -73,7 +73,7 @@ import { handleOllamaReply } from './features/ollama';
 import { announceCommand, handleAnnounce, handleAnnounceModal } from './commands/announce';
 
 // import { incrementMessageCount } from './utils/database';
-
+const voiceWebhookCache = new Map<string, string>(); // channelId -> webhookId
 // ── Client ────────────────────────────────────────────────────
 
 const client = new Client({
@@ -210,7 +210,25 @@ async function handleVoiceTranscribe(message: Message): Promise<void> {
       return;
     }
 
-    await message.reply(transcript);
+    // Send via webhook so it appears with the user's avatar and name
+    const channel = message.channel as TextChannel;
+    let webhook;
+    const cachedId = voiceWebhookCache.get(channel.id);
+    const hooks = await channel.fetchWebhooks();
+    webhook = cachedId ? hooks.get(cachedId) : hooks.find(h => h.owner?.id === client.user?.id);
+    if (!webhook) {
+      webhook = await channel.createWebhook({ name: 'Voice Transcribe' });
+    }
+    voiceWebhookCache.set(channel.id, webhook.id);
+
+    const member = message.member;
+    await webhook.send({
+      content: `🎙️ ${transcript}`,
+      username: member?.displayName ?? message.author.username,
+      avatarURL: member?.displayAvatarURL({ size: 256 }) ?? message.author.displayAvatarURL({ size: 256 }),
+      allowedMentions: { parse: [] },
+    });
+
   } catch (e) {
     console.error("[voiceTranscribe] Error:", e);
     await message.reply("❌ Failed to transcribe the voice message.");
