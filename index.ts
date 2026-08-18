@@ -73,6 +73,7 @@ import { handleOllamaReply } from './features/ollama';
 import { announceCommand, handleAnnounce, handleAnnounceModal } from './commands/announce';
 // Add to imports at the top
 import { handleXFixer } from './features/xFixer';
+import { handleStickyRolesLeave, handleStickyRolesJoin } from './features/stickyRoles';
 
 // import { incrementMessageCount } from './utils/database';
 const voiceWebhookCache = new Map<string, string>(); // channelId -> webhookId
@@ -128,8 +129,13 @@ client.once('ready', async () => {
   loadMarkovConfig();
   await checkAuditLogPermission(client);
   startSweepLoop(client);
-  loadActivityConfig("1477702227899715596");
+  for (const guild of client.guilds.cache.values()) {
+  loadActivityConfig(guild.id);
+}
   startVoiceFlushLoop();
+});
+  client.on('guildCreate', (guild) => {
+  loadActivityConfig(guild.id);
 });
 
 // ── Bot mention handler ───────────────────────────────────────
@@ -294,10 +300,12 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 // ── Members ───────────────────────────────────────────────────
 client.on('guildMemberAdd', (member) => {
   logMemberJoin(member as any);
+  handleStickyRolesJoin(member);
 });
 
 client.on('guildMemberRemove', (member) => {
   logMemberLeave(member as any);
+  handleStickyRolesLeave(member);
 });
 
 client.on('guildMemberUpdate', (oldMember, newMember) => {

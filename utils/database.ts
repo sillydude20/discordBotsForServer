@@ -90,6 +90,12 @@ function initDatabase() {
       message_id TEXT PRIMARY KEY,
       guild_id   TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS sticky_roles (
+      guild_id TEXT NOT NULL,
+      user_id  TEXT NOT NULL,
+      role_ids TEXT NOT NULL DEFAULT '[]',
+      PRIMARY KEY (guild_id, user_id)
+    );
   `);
 }
 initDatabase();
@@ -566,4 +572,24 @@ export function getRecentMessagesByUser(guildId: string, userId: string,): strin
     ORDER BY created_timestamp DESC
     LIMIT 1000
     `).all(guildId, userId,) as any[]).map(row => row.content);
+}
+// ─── Sticky Roles ─────────────────────────────────────────────
+
+export function saveMemberRoles(guildId: string, userId: string, roleIds: string[]): void {
+  db.prepare(`
+    INSERT INTO sticky_roles (guild_id, user_id, role_ids)
+    VALUES (?, ?, ?)
+    ON CONFLICT(guild_id, user_id) DO UPDATE SET role_ids = excluded.role_ids
+  `).run(guildId, userId, JSON.stringify(roleIds));
+}
+
+export function getMemberRoles(guildId: string, userId: string): string[] {
+  const row = db.prepare(
+    "SELECT role_ids FROM sticky_roles WHERE guild_id = ? AND user_id = ?"
+  ).get(guildId, userId) as any;
+  return row ? JSON.parse(row.role_ids) : [];
+}
+
+export function deleteMemberRoles(guildId: string, userId: string): void {
+  db.prepare("DELETE FROM sticky_roles WHERE guild_id = ? AND user_id = ?").run(guildId, userId);
 }
