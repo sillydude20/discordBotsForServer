@@ -73,7 +73,11 @@ import { handleOllamaReply } from './features/ollama';
 import { announceCommand, handleAnnounce, handleAnnounceModal } from './commands/announce';
 // Add to imports at the top
 import { handleXFixer } from './features/xFixer';
-import { handleStickyRolesLeave, handleStickyRolesJoin } from './features/stickyRoles';
+import { handleStickyRolesLeave, handleStickyRolesJoin } from './features/sticky';
+
+
+const AUTO_ROLE_GUILD_ID = '1469371127112536271';
+const AUTO_ROLE_IDS = ['1477773684596019241', '1478598288096755984'];
 
 // import { incrementMessageCount } from './utils/database';
 const voiceWebhookCache = new Map<string, string>(); // channelId -> webhookId
@@ -298,9 +302,17 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 });
 
 // ── Members ───────────────────────────────────────────────────
-client.on('guildMemberAdd', (member) => {
+client.on('guildMemberAdd', async (member) => {
   logMemberJoin(member as any);
   handleStickyRolesJoin(member);
+  if (member.guild.id === AUTO_ROLE_GUILD_ID) {
+    try {
+      await member.roles.add(AUTO_ROLE_IDS, 'Auto-assigned on join');
+      console.log(`[autoRole] Assigned default roles to ${member.user.tag}`);
+    } catch (e) {
+      console.error('[autoRole] Failed to assign roles:', e);
+    }
+  }
 });
 
 client.on('guildMemberRemove', (member) => {

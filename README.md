@@ -10,10 +10,14 @@ Dead Channel
 Bans
 Warnings
 Auto assigning roles
-Roles being kept on rejoin and leave
+###Roles being kept on rejoin and leave####
 Specific member full message delete? 
 Limbo role (ripping off other roles temp) 
 
 
 
 Need a name role command - like name the role it gives you for color right?
+
+
+1477773684596019241
+1478598288096755984
