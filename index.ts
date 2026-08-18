@@ -74,7 +74,23 @@ import { announceCommand, handleAnnounce, handleAnnounceModal } from './commands
 // Add to imports at the top
 import { handleXFixer } from './features/xFixer';
 import { handleStickyRolesLeave, handleStickyRolesJoin } from './features/sticky';
+import {
+  trackLastMessage,
+  startDeadRoleSweep,
+  handleDeadChannelReactivation,
+} from './features/deadRoles';
+import { limboCommand, unlimboCommand, handleLimboInteraction, handleUnlimboInteraction } from './commands/limbo';
 
+import {
+  warnCommand,
+  warningsCommand,
+  clearWarningsCommand,
+  banCommand,
+  handleWarnInteraction,
+  handleWarningsInteraction,
+  handleClearWarningsInteraction,
+  handleBanInteraction,
+} from './commands/moderation';
 
 const AUTO_ROLE_GUILD_ID = '1469371127112536271';
 const AUTO_ROLE_IDS = ['1477773684596019241', '1478598288096755984'];
@@ -120,10 +136,16 @@ client.once('ready', async () => {
         sayCommand.toJSON(),
         activityCommand.toJSON(),
         announceCommand.toJSON(),
+        limboCommand.toJSON(),
+        unlimboCommand.toJSON(),
+        warnCommand.toJSON(),
+        warningsCommand.toJSON(),
+        clearWarningsCommand.toJSON(),
+        banCommand.toJSON(),
       ],
     },
   );
-  
+  startDeadRoleSweep(client);
   console.log('✅ Slash commands registered');
 
   setupStarboard(client);
@@ -273,13 +295,15 @@ client.on('messageCreate', async (message) => {
   handleMarkovMessage(message, client);
   await handleVoiceTranscribe(message);
 
-  if (message.guild) {
-        handleActivityMessage(message.guild.id, message.author.id, message.channelId);
-      }
-
   if (message.mentions.has(client.user!.id)) {
     await handleBotMention(message);
   }
+  if (message.guild) {
+  handleActivityMessage(message.guild.id, message.author.id, message.channelId);
+  trackLastMessage(message.guild.id, message.author.id, message.createdTimestamp);
+}
+
+await handleDeadChannelReactivation(message); 
 
   
 });
@@ -409,11 +433,51 @@ client.on('interactionCreate', async (interaction) => {
   return;
 }
 
+  if (cmd === 'limbo') {
+  if (!await checkAdminRole(interaction)) return;
+  await handleLimboInteraction(interaction);
+  return;
+}
+
+if (cmd === 'unlimbo') {
+  if (!await checkAdminRole(interaction)) return;
+  await handleUnlimboInteraction(interaction);
+  return;
+}
+
+if (cmd === 'warn') {
+  if (!await checkAdminRole(interaction)) return;
+  await handleWarnInteraction(interaction);
+  return;
+}
+
+if (cmd === 'warnings') {
+  if (!await checkAdminRole(interaction)) return;
+  await handleWarningsInteraction(interaction);
+  return;
+}
+
+if (cmd === 'clearwarnings') {
+  if (!await checkAdminRole(interaction)) return;
+  await handleClearWarningsInteraction(interaction);
+  return;
+}
+
+if (cmd === 'ban') {
+  if (!await checkAdminRole(interaction)) return;
+  await handleBanInteraction(interaction);
+  return;
+}
+
   // Starboard + confession config (collection-based commands)
   const command = commands.get(cmd);
   if (!command) return;
   if (!await checkAdminRole(interaction)) return;
   await command.execute(interaction as ChatInputCommandInteraction);
+
+  
+
+
 });
 
 client.login(process.env.BOT_TOKEN!);

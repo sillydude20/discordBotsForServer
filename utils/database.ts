@@ -96,6 +96,34 @@ function initDatabase() {
       role_ids TEXT NOT NULL DEFAULT '[]',
       PRIMARY KEY (guild_id, user_id)
     );
+    CREATE TABLE IF NOT EXISTS user_last_message (
+      guild_id        TEXT NOT NULL,
+      user_id         TEXT NOT NULL,
+      last_message_ts INTEGER NOT NULL,
+      PRIMARY KEY (guild_id, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS dead_role_backup (
+      guild_id TEXT NOT NULL,
+      user_id  TEXT NOT NULL,
+      role_ids TEXT NOT NULL DEFAULT '[]',
+      PRIMARY KEY (guild_id, user_id)
+);    
+  CREATE TABLE IF NOT EXISTS limbo_role_backup (
+      guild_id TEXT NOT NULL,
+      user_id  TEXT NOT NULL,
+      role_ids TEXT NOT NULL DEFAULT '[]',
+      PRIMARY KEY (guild_id, user_id)
+);
+    CREATE TABLE IF NOT EXISTS warnings (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id   TEXT NOT NULL,
+      user_id    TEXT NOT NULL,
+      points     INTEGER NOT NULL,
+      reason     TEXT NOT NULL DEFAULT '',
+      mod_id     TEXT NOT NULL,
+      created_ts INTEGER NOT NULL
+);
   `);
 }
 initDatabase();
@@ -592,4 +620,119 @@ export function getMemberRoles(guildId: string, userId: string): string[] {
 
 export function deleteMemberRoles(guildId: string, userId: string): void {
   db.prepare("DELETE FROM sticky_roles WHERE guild_id = ? AND user_id = ?").run(guildId, userId);
+}
+
+
+// ─── Dead Role Tracking ───────────────────────────────────────
+
+export function updateLastMessageTimestamp(guildId: string, userId: string, ts: number): void {
+  db.prepare(`
+    INSERT INTO user_last_message (guild_id, user_id, last_message_ts)
+    VALUES (?, ?, ?)
+    ON CONFLICT(guild_id, user_id) DO UPDATE SET last_message_ts = excluded.last_message_ts
+  `).run(guildId, userId, ts);
+}
+
+export function getLastMessageTimestamp(guildId: string, userId: string): number | null {
+  const row = db.prepare(
+    "SELECT last_message_ts FROM user_last_message WHERE guild_id = ? AND user_id = ?"
+  ).get(guildId, userId) as any;
+  return row?.last_message_ts ?? null;
+}
+
+export function getInactiveUserIds(guildId: string, cutoffTs: number): string[] {
+  return (db.prepare(
+    "SELECT user_id FROM user_last_message WHERE guild_id = ? AND last_message_ts < ?"
+  ).all(guildId, cutoffTs) as any[]).map(r => r.user_id);
+}
+
+export function saveDeadRoleBackup(guildId: string, userId: string, roleIds: string[]): void {
+  db.prepare(`
+    INSERT INTO dead_role_backup (guild_id, user_id, role_ids)
+    VALUES (?, ?, ?)
+    ON CONFLICT(guild_id, user_id) DO UPDATE SET role_ids = excluded.role_ids
+  `).run(guildId, userId, JSON.stringify(roleIds));
+}
+
+export function getDeadRoleBackup(guildId: string, userId: string): string[] {
+  const row = db.prepare(
+    "SELECT role_ids FROM dead_role_backup WHERE guild_id = ? AND user_id = ?"
+  ).get(guildId, userId) as any;
+  return row ? JSON.parse(row.role_ids) : [];
+}
+
+export function deleteDeadRoleBackup(guildId: string, userId: string): void {
+  db.prepare("DELETE FROM dead_role_backup WHERE guild_id = ? AND user_id = ?").run(guildId, userId);
+}
+
+// ─── Limbo Role Backup ────────────────────────────────────────
+
+export function saveLimboBackup(guildId: string, userId: string, roleIds: string[]): void {
+  db.prepare(`
+    INSERT INTO limbo_role_backup (guild_id, user_id, role_ids)
+    VALUES (?, ?, ?)
+    ON CONFLICT(guild_id, user_id) DO UPDATE SET role_ids = excluded.role_ids
+  `).run(guildId, userId, JSON.stringify(roleIds));
+}
+
+export function getLimboBackup(guildId: string, userId: string): string[] | null {
+  const row = db.prepare(
+    "SELECT role_ids FROM limbo_role_backup WHERE guild_id = ? AND user_id = ?"
+  ).get(guildId, userId) as any;
+  return row ? JSON.parse(row.role_ids) : null;
+}
+
+export function deleteLimboBackup(guildId: string, userId: string): void {
+  db.prepare("DELETE FROM limbo_role_backup WHERE guild_id = ? AND user_id = ?").run(guildId, userId);
+}
+
+// ─── Warnings ─────────────────────────────────────────────────
+
+export interface WarningRow {
+  id: number;
+  guildId: string;
+  userId: string;
+  points: number;
+  reason: string;
+  modId: string;
+  createdTs: number;
+}
+
+export function addWarning(
+  guildId: string, userId: string, points: number, reason: string, modId: string,
+): void {
+  db.prepare(`
+    INSERT INTO warnings (guild_id, user_id, points, reason, mod_id, created_ts)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(guildId, userId, points, reason, modId, Date.now());
+}
+
+export function getWarnings(guildId: string, userId: string): WarningRow[] {
+  return (db.prepare(
+    "SELECT * FROM warnings WHERE guild_id = ? AND user_id = ? ORDER BY created_ts DESC"
+  ).all(guildId, userId) as any[]).map(row => ({
+    id: row.id,
+    guildId: row.guild_id,
+    userId: row.user_id,
+    points: row.points,
+    reason: row.reason,
+    modId: row.mod_id,
+    createdTs: row.created_ts,
+  }));
+}
+
+export function getTotalWarningPoints(guildId: string, userId: string): number {
+  const row = db.prepare(
+    "SELECT SUM(points) as total FROM warnings WHERE guild_id = ? AND user_id = ?"
+  ).get(guildId, userId) as any;
+  return row?.total ?? 0;
+}
+
+export function clearWarnings(guildId: string, userId: string): void {
+  db.prepare("DELETE FROM warnings WHERE guild_id = ? AND user_id = ?").run(guildId, userId);
+}
+
+export function removeWarningById(warningId: number): boolean {
+  const result = db.prepare("DELETE FROM warnings WHERE id = ?").run(warningId);
+  return result.changes > 0;
 }
