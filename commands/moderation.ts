@@ -11,8 +11,40 @@ import {
   removeWarningById,
 } from '../utils/database';
 
-// ── TODO: adjust threshold if you want something other than 3 ──
-const BAN_THRESHOLD_POINTS = 3;
+// ─── Warning reason presets ─────────────────────────────────────
+// value = what gets stored in the "choice" internally
+// label = what shows in the dropdown
+// points = weight of this warning (kept for record-keeping / severity, no longer tied to a ban threshold)
+
+interface WarningReason {
+  value: string;
+  label: string;
+  points: number;
+}
+
+const WARNING_REASONS: WarningReason[] = [
+  { value: 'gore_shock',            label: 'Gore/Shock media',                          points: 1 },
+  { value: 'hardcore_porn_harm',    label: 'Hardcore porn (bodily harm/death)',         points: 1 },
+  { value: 'loli_porn',             label: 'Loli porn (instant ban in general chat)',   points: 1 },
+  { value: 'revenge_porn',          label: 'Revenge porn',                              points: 1 },
+  { value: 'nsfw_general',          label: 'NSFW/NSFL in general chat',                 points: 1 },
+  { value: 'poaching',              label: 'Poaching (publicly)',                       points: 1 },
+  { value: 'harassment_suicide',    label: 'Harassment (suicide encouragement)',        points: 2 },
+  { value: 'racism_transphobia',    label: 'Overboard racism/transphobia',              points: 2 },
+  { value: 'sexualizing_minors',    label: 'Sexualizing minors',                        points: 2 },
+  { value: 'threatening_server',    label: 'Threatening the server (incl. misinfo)',    points: 2 },
+  { value: 'threatening_selfharm',  label: 'Threatening self harm',                     points: 2 },
+  { value: 'accusation_pedo',       label: 'Accusation of pedo without proof',          points: 2 },
+  { value: 'reportfagging',         label: 'Reportingfagging',                          points: 1 },
+  { value: 'doxxing',               label: 'Doxxing (ban)',                             points: 3 },
+  { value: 'blackmail',             label: 'Blackmail (ban)',                           points: 3 },
+  { value: 'extremism',             label: 'Extremism',                                 points: 1 },
+  { value: 'cutting_vc',            label: 'Cutting/Injecting in VC, witnessed (ban)',  points: 3 },
+];
+
+function getReasonByValue(value: string): WarningReason | undefined {
+  return WARNING_REASONS.find(r => r.value === value);
+}
 
 // ─── Command definitions ───────────────────────────────────────
 
@@ -20,10 +52,16 @@ export const warnCommand = new SlashCommandBuilder()
   .setName('warn')
   .setDescription('Give a user warning points')
   .addUserOption(opt => opt.setName('user').setDescription('The user to warn').setRequired(true))
-  .addIntegerOption(opt =>
-    opt.setName('points').setDescription('How many warning points').setRequired(true).setMinValue(1).setMaxValue(3),
+  .addStringOption(opt =>
+    opt
+      .setName('reason')
+      .setDescription('Reason for the warning')
+      .setRequired(true)
+      .addChoices(...WARNING_REASONS.map(r => ({ name: r.label, value: r.value }))),
   )
-  .addStringOption(opt => opt.setName('reason').setDescription('Reason for the warning').setRequired(false));
+  .addStringOption(opt =>
+    opt.setName('note').setDescription('Optional extra context/details').setRequired(false),
+  );
 
 export const warningsCommand = new SlashCommandBuilder()
   .setName('warnings')
@@ -52,8 +90,17 @@ export async function handleWarnInteraction(interaction: ChatInputCommandInterac
   }
 
   const targetUser = interaction.options.getUser('user', true);
-  const points = interaction.options.getInteger('points', true);
-  const reason = interaction.options.getString('reason') ?? 'No reason provided';
+  const reasonValue = interaction.options.getString('reason', true);
+  const note = interaction.options.getString('note');
+
+  const reasonPreset = getReasonByValue(reasonValue);
+  if (!reasonPreset) {
+    await interaction.editReply('Unrecognized reason — please pick one from the dropdown.');
+    return;
+  }
+
+  const points = reasonPreset.points;
+  const fullReason = note ? `${reasonPreset.label} — ${note}` : reasonPreset.label;
 
   const member = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
   if (!member) {
@@ -61,24 +108,19 @@ export async function handleWarnInteraction(interaction: ChatInputCommandInterac
     return;
   }
 
-  addWarning(interaction.guild.id, targetUser.id, points, reason, interaction.user.id);
+  addWarning(interaction.guild.id, targetUser.id, points, fullReason, interaction.user.id);
+
+  const allWarnings = getWarnings(interaction.guild.id, targetUser.id);
+  const warnCount = allWarnings.length;
   const totalPoints = getTotalWarningPoints(interaction.guild.id, targetUser.id);
 
   await member.send(
-    `You were warned in **${interaction.guild.name}**: ${reason} (+${points} point(s))`,
+    `You were warned in **${interaction.guild.name}**: ${fullReason}`,
   ).catch(() => null); // best-effort, ignore if DMs are closed
 
-  if (totalPoints >= BAN_THRESHOLD_POINTS) {
-    await interaction.editReply(
-      `⚠️ ${targetUser.tag} was warned ${points} point(s) for: ${reason}\n` +
-      `🚨 That brings them to **${totalPoints} total points** — at or above the ${BAN_THRESHOLD_POINTS}-point threshold. Consider a manual \`/ban\`.`,
-    );
-    return;
-  }
-
   await interaction.editReply(
-    `⚠️ ${targetUser.tag} was warned ${points} point(s) for: ${reason}\n` +
-    `Total: ${totalPoints}/${BAN_THRESHOLD_POINTS} points.`,
+    `⚠️ ${targetUser.tag} was warned for: ${fullReason}\n` +
+    `This is warning **#${warnCount}** for this user (${totalPoints} total point(s)).`,
   );
 }
 
@@ -101,14 +143,18 @@ export async function handleWarningsInteraction(interaction: ChatInputCommandInt
 
   const embed = new EmbedBuilder()
     .setTitle(`Warnings for ${targetUser.tag}`)
-    .setDescription(`Total: ${totalPoints}/${BAN_THRESHOLD_POINTS} points`)
+    .setDescription(`Total: **${warnings.length}** warning(s), ${totalPoints} point(s)`)
     .setColor(0xffaa00)
     .addFields(
-      warnings.slice(0, 10).map(w => ({
-        name: `#${w.id} — ${w.points} point(s) — <t:${Math.floor(w.createdTs / 1000)}:R>`,
+      warnings.slice(0, 10).map((w, i) => ({
+        name: `#${warnings.length - i} — ${w.points} point(s) — <t:${Math.floor(w.createdTs / 1000)}:R>`,
         value: `Reason: ${w.reason}\nBy: <@${w.modId}>`,
       })),
     );
+
+  if (warnings.length > 10) {
+    embed.setFooter({ text: `Showing 10 most recent of ${warnings.length} total warnings` });
+  }
 
   await interaction.editReply({ embeds: [embed] });
 }
