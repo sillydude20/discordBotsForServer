@@ -171,8 +171,8 @@ async function bulkDeleteChannel(channel: TextChannel): Promise<number> {
     const fetched: Collection<Snowflake, Message> = await channel.messages.fetch({ limit: 100 });
     if (!fetched.size) break;
 
-    const recent = fetched.filter((m) => Date.now() - m.createdTimestamp < TWO_WEEKS && !ignoredMessages.has(m.id));
-    const old    = fetched.filter((m) => Date.now() - m.createdTimestamp >= TWO_WEEKS && !ignoredMessages.has(m.id));
+    const recent = fetched.filter((m) => Date.now() - m.createdTimestamp < TWO_WEEKS && !ignoredMessages.has(m.id) && !m.pinned);
+    const old    = fetched.filter((m) => Date.now() - m.createdTimestamp >= TWO_WEEKS && !ignoredMessages.has(m.id) && !m.pinned);
 
     if (recent.size > 1) {
       const result = await channel.bulkDelete(recent, true);
@@ -204,7 +204,7 @@ async function sweepChannel(channel: TextChannel, delayMs: number): Promise<numb
     const fetched: Collection<Snowflake, Message> = await channel.messages.fetch(options);
     if (!fetched.size) break;
 
-    const toDelete = fetched.filter((m) => m.createdTimestamp < cutoff && !ignoredMessages.has(m.id));
+    const toDelete = fetched.filter((m) => m.createdTimestamp < cutoff && !ignoredMessages.has(m.id) && !m.pinned);
     const recent   = toDelete.filter((m) => Date.now() - m.createdTimestamp < TWO_WEEKS);
     const old      = toDelete.filter((m) => Date.now() - m.createdTimestamp >= TWO_WEEKS);
 
@@ -269,7 +269,9 @@ export function handleMessage(message: Message): void {
       // Re-check ignore in case it was added after the message was sent
       if (ignoredMessages.has(message.id)) return;
       const msg = await message.channel.messages.fetch(message.id).catch(() => null);
-      if (msg) await msg.delete();
+      if (!msg) return;
+      if (msg.pinned) return; // don't delete pinned messages
+      await msg.delete();
     } catch { /* already deleted */ }
   }, rule.delayMs);
 }

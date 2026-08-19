@@ -64,24 +64,15 @@ export async function handleWarnInteraction(interaction: ChatInputCommandInterac
   addWarning(interaction.guild.id, targetUser.id, points, reason, interaction.user.id);
   const totalPoints = getTotalWarningPoints(interaction.guild.id, targetUser.id);
 
+  await member.send(
+    `You were warned in **${interaction.guild.name}**: ${reason} (+${points} point(s))`,
+  ).catch(() => null); // best-effort, ignore if DMs are closed
+
   if (totalPoints >= BAN_THRESHOLD_POINTS) {
-    try {
-      await member.send(
-        `You have been banned from **${interaction.guild.name}** for accumulating ${totalPoints} warning point(s).`,
-      ).catch(() => null); // DMs may be closed, don't block the ban on this
-
-      await member.ban({ reason: `Auto-ban: reached ${totalPoints} warning points` });
-
-      await interaction.editReply(
-        `⚠️ ${targetUser.tag} was warned ${points} point(s) for: ${reason}\n` +
-        `🔨 That brought them to ${totalPoints} total points — **auto-banned**.`,
-      );
-    } catch (e) {
-      console.error('[moderation] Error auto-banning member:', e);
-      await interaction.editReply(
-        `⚠️ ${targetUser.tag} was warned but hit the ban threshold and I failed to ban them — check my permissions/role hierarchy.`,
-      );
-    }
+    await interaction.editReply(
+      `⚠️ ${targetUser.tag} was warned ${points} point(s) for: ${reason}\n` +
+      `🚨 That brings them to **${totalPoints} total points** — at or above the ${BAN_THRESHOLD_POINTS}-point threshold. Consider a manual \`/ban\`.`,
+    );
     return;
   }
 
